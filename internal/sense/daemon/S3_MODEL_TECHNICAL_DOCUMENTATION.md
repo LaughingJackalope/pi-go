@@ -291,6 +291,37 @@ We extracted the shared Apple Silicon neuro-symbolic engine into [`S3Core.swift`
 | **4. [`s3-tactics`](file:///Users/mp/decision/s3_tactics.swift)**<br/>Final Fantasy Tactics 3v3 Grid | Boot: `~25,800 ms`<br/>Turn P50: `19.00 ms`<br/>S2: 1-ply static sum | Boot: **`171.8 ms`**<br/>Turn P50: **`6.13 ms`**<br/>S2: **5-ply CT clock (`5,286` states)** | Wins: **`15/16` (`93.8%`)** vs Naive `6/16`<br/>Friendly-Fire: **`0`** vs Naive `5`<br/>Backstabs: **`49`** | **3.10× faster turn**<br/>**5-ply dynamic CT lookahead**<br/>**0 friendly-fire hits** |
 | **5. [`s3-breach`](file:///Users/mp/decision/s3_breach.swift)**<br/>Weird-Machine Flaw Hunter | Boot: `~25,800 ms`<br/>Step P50: `20.10 ms`<br/>Total Audit: `~245 ms` (`12` steps) | Boot: **`178.7 ms`**<br/>Step P50: **`5.84 ms`**<br/>Total Audit: **`77.5 ms` (`12` steps)** | Flaws: **`4/4` (`100%` in 12 steps)**<br/>Ghost States Split: **`5/5`**<br/>Chaos Monkey @12: `3/4` | **3.44× faster step**<br/>**Full 4-flaw audit in `77.5 ms`** |
 
+---
+
+## 10. Dual-Tier Local S3 Cortex Cascade: Tier-1A `mmBERT-base` ($L=96$ ANE) $\rightarrow$ Tier-1B `ModernBERT-large` ($L=512$ GPU)
+
+We investigated the relationship between the checkpoint inside `./models/snake` (`aac6fef/laya-multilingual-coreml-ane`, exported from `convaiinnovations/laya-multilingual` / `jhu-clsp/mmBERT-base`) and the original English/code base Laya checkpoint cached locally in `~/.cache/huggingface/hub/models--aac6fef--laya-coreml` (`convaiinnovations/laya` / `answerdotai/ModernBERT-large`, `842.7 MB` FP16, 28 layers, $d=1024$, enumerated shapes $L \in \{16, 32, 64, 96, 128, 192, 256, 384, 512\}$):
+
+1. **Structural Parameter Budget Difference:**
+   - `mmBERT-base` (`322M` total parameters) spends **`~197M` parameters (`61%` of the model)** on its 256,000-token multilingual embedding table, leaving **~125M parameters** in its 22-layer ($d=768$) transformer body and truncating states at **$L=96$** tokens.
+   - `ModernBERT-large` (`~420M` total parameters) uses a compact **50,368-token English/code ByteLevel BPE vocabulary** (`4.00 MB` in our zero-copy `tokenizer_mmap.bin`, exported via [`export_l512_swift_bundle.py`](file:///Users/mp/decision/export_l512_swift_bundle.py)) and puts **~395M parameters (`3.1×` larger transformer backbone)** into 28 layers ($d=1024$) with a **512-token context window**.
+2. **Per-Bucket `MLModel` Shape Cache in [`S3Core.swift`](file:///Users/mp/decision/S3Core.swift#L859-L1190):**
+   - In CoreML (`MPSGraph`), alternating sequence lengths ($L=128$ for `choice` vs. $L=64$ for `noul`) on a single `MLModel` instance triggers a ~500 ms `MPSGraph` reshape recompilation on every call (`1,037 ms/turn`).
+   - Maintaining dedicated per-bucket `MLModel` instances (`shapeModels[bucketLen]`) in `S3L512Engine` dropped `ModernBERT-large` 2-question latency in native Swift from **`1,037.4 ms` $\rightarrow$ `65.01 ms` P50 (`128.22 ms` P95)**—faster than Python `laya_coreml` (`95.87 ms` P50 / `532.18 ms` P95).
+3. **Three-Trigger Dual-Tier Local Cascade ([`s3_dualtier_bench.swift`](file:///Users/mp/decision/s3_dualtier_bench.swift) & [`s3_cortexd.swift`](file:///Users/mp/decision/s3_cortexd.swift)):**
+   - Every query executes first on **Tier-1A Reflex (`mmBERT-base` $L=96$ on M2 Neural Engine, `~6–7.5 ms/question`)**.
+   - The query automatically cascades locally to **Tier-1B Deep Cortex (`ModernBERT-large` $L=512$ on M2 GPU)** if and only if:
+     1. **Context Truncation (`stateTokensDropped > 0`):** The state exceeded $L=96$ and dropped tail telemetry.
+     2. **Ambiguous Choice Margin (`top1 - top2 < 0.25`):** Tier-1A is uncertain between the top two options.
+     3. **Entailment Self-Consistency Violation:** Tier-1A selected an option marked `"Unsafe."`, `"Blocked."`, or `"Suboptimal"` when a `"Safe. Best"` option was present in the rubric.
+
+### 10.1 Measured 3-Way Native Swift Benchmark Across 12 Unshielded Cases ([`s3_dualtier_swift_results.json`](file:///Users/mp/decision/s3_dualtier_swift_results.json))
+
+| Metric (12 Unshielded Cases: 8 Arena + 4 Verbose `pi-go`) | 1. Tier-1A Only (`mmBERT-base`)<br/>322M · Fixed $L=96$ · M2 ANE | 2. Tier-1B Only (`ModernBERT-large`)<br/>420M · Enumerated $L=512$ · M2 GPU | 3. Dual-Tier Local Cascade<br/>(`Tier-1A L96 ANE` $\rightarrow$ `Tier-1B L512 GPU`) | Dual-Tier Cascade Advantage |
+| :--- | :---: | :---: | :---: | :---: |
+| **Short-Prompt Arena Choice Accuracy** (8 Cases) | `4 / 8` (`50.0%`) | `6 / 8` (`75.0%`) | **`8 / 8` (`100.0%`)** | **Beats both models (+50 pp vs T1A, +25 pp vs T1B)** |
+| **Verbose `pi-go` Telemetry Choice Accuracy** (4 Tail Cases) | `1 / 4` (`25.0%`) | `2 / 4` (`50.0%`) | **`2 / 4` (`50.0%`)** | **2.0× higher long-context accuracy** |
+| **Overall Unshielded `choice` Accuracy** (12 Cases) | `5 / 12` (`41.7%`) | `8 / 12` (`66.7%`) | **`10 / 12` (`83.3%`)** | **+41.6 pp over T1A · +16.6 pp over T1B** |
+| **Overall `noul` Boolean Accuracy** (12 Cases) | `7 / 12` (`58.3%`) | **`10 / 12` (`83.3%`)** | **`9 / 12` (`75.0%`)** | **+16.7 pp over T1A alone** |
+| **Context Truncation** (Cases Truncated / Dropped Tokens) | `4 / 12` (`269` tok dropped) | **`0 / 12` (`0` tok dropped)** | **`0 / 12` (`0` tok dropped)** | **100% of dropped tail tokens recovered** |
+| **Fast-Path / Overall 2-Question Latency** (P50) | `17.69 ms` | `65.01 ms` | **`15.93 ms` fast-path** (`84.40 ms` escalated) | **4.1× faster fast-path than Tier-1B alone** |
+
+
 
 
 

@@ -281,6 +281,311 @@ final class S3Tokenizer {
 
 // MARK: - Question & Sequence Builder (`laya_coreml/common.py` exact port)
 
+final class S3ByteLevelTokenizer {
+    private let mmapFile: MMapFile
+    private let mergeCap: Int
+    private let mergeMask: UInt64
+    private let byteToIdPtr: UnsafePointer<UInt32>
+    private let mergeTablePtr: UnsafePointer<MergeSlot>
+    private var addedTokens: [AddedToken] = []
+    private var tokenCache: [String: [Int]] = [:]
+    private let regex: NSRegularExpression
+
+    let unkId: Int = 50280
+    let clsId: Int
+    let sepId: Int
+    let padId: Int
+    let maskId: Int
+    let maskToken: String = "[MASK]"
+
+    init(mmapPath: String) throws {
+        self.mmapFile = try MMapFile(path: mmapPath)
+        let base = mmapFile.rawPtr
+        let headerU32 = base.assumingMemoryBound(to: UInt32.self)
+        self.mergeCap = Int(headerU32[2])
+        self.mergeMask = UInt64(mergeCap - 1)
+        let numAdded = Int(headerU32[3])
+        self.clsId  = Int(headerU32[4])
+        self.sepId  = Int(headerU32[5])
+        self.padId  = Int(headerU32[6])
+        self.maskId = Int(headerU32[7])
+
+        var offset = 32
+        self.byteToIdPtr = base.advanced(by: offset).assumingMemoryBound(to: UInt32.self)
+        offset += 256 * 4
+        self.mergeTablePtr = base.advanced(by: offset).assumingMemoryBound(to: MergeSlot.self)
+        offset += mergeCap * 16
+
+        var list: [AddedToken] = []
+        list.reserveCapacity(numAdded)
+        for _ in 0..<numAdded {
+            let tid = Int(base.loadUnaligned(fromByteOffset: offset, as: UInt32.self))
+            let flags = base.loadUnaligned(fromByteOffset: offset + 4, as: UInt8.self)
+            let blen = Int(base.loadUnaligned(fromByteOffset: offset + 5, as: UInt16.self))
+            offset += 7
+            let bptr = base.advanced(by: offset).assumingMemoryBound(to: UInt8.self)
+            let bytes = Array(UnsafeBufferPointer(start: bptr, count: blen))
+            offset += blen
+            if let s = String(bytes: bytes, encoding: .utf8), !s.isEmpty {
+                list.append(AddedToken(bytes: bytes, str: s, id: tid, lstrip: (flags & 2) != 0))
+            }
+        }
+        self.addedTokens = list
+        self.regex = try NSRegularExpression(
+            pattern: #"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"#,
+            options: []
+        )
+    }
+
+    @inline(__always)
+    private func lookupMerge(_ leftId: Int, _ rightId: Int) -> (rank: UInt32, mergedId: Int)? {
+        let key = (UInt64(UInt32(leftId)) << 32) | UInt64(UInt32(rightId))
+        var h = ((key &* 11400714819323198485) >> 46) & mergeMask
+        while true {
+            let slot = mergeTablePtr[Int(h)]
+            if slot.key == 0 { return nil }
+            if slot.key == key { return (slot.rank, Int(slot.mergedId)) }
+            h = (h &+ 1) & mergeMask
+        }
+    }
+
+    private func bpeBytes(_ utf8: ArraySlice<UInt8>) -> [Int] {
+        if utf8.isEmpty { return [] }
+        var syms = utf8.map { Int(byteToIdPtr[Int($0)]) }
+        while syms.count >= 2 {
+            var bestRank: UInt32 = UInt32.max
+            var bestIdx: Int = -1
+            var bestMerged: Int = -1
+            for i in 0..<(syms.count - 1) {
+                if let info = lookupMerge(syms[i], syms[i + 1]), info.rank < bestRank {
+                    bestRank = info.rank
+                    bestIdx = i
+                    bestMerged = info.mergedId
+                }
+            }
+            if bestIdx < 0 { break }
+            syms[bestIdx] = bestMerged
+            syms.remove(at: bestIdx + 1)
+        }
+        return syms
+    }
+
+    private func encodeSegment(_ seg: String) -> [Int] {
+        if seg.isEmpty { return [] }
+        let ns = seg as NSString
+        let matches = regex.matches(in: seg, options: [], range: NSRange(location: 0, length: ns.length))
+        var out: [Int] = []
+        for m in matches {
+            let piece = ns.substring(with: m.range)
+            let bytes = Array(piece.utf8)
+            out.append(contentsOf: bpeBytes(bytes[0..<bytes.count]))
+        }
+        return out
+    }
+
+    func encode(_ text: String, truncation: Bool = false, maxLength: Int? = nil) -> [Int] {
+        if text.isEmpty { return [] }
+        if !truncation, let cached = tokenCache[text] { return cached }
+        let utf8 = Array(text.utf8)
+        let n = utf8.count
+        var i = 0
+        var segStart = 0
+        var out: [Int] = []
+
+        while i < n {
+            var matched: AddedToken? = nil
+            let b0 = utf8[i]
+            if b0 == 32 || b0 == 60 || b0 == 91 || b0 == 124 {
+                for cand in addedTokens {
+                    let clen = cand.bytes.count
+                    if i + clen <= n && cand.bytes[0] == b0 {
+                        if b0 == 32 && clen >= 2 {
+                            let afterIdx = i + clen
+                            if afterIdx < n && utf8[afterIdx] != 32 { continue }
+                        }
+                        var ok = true
+                        for k in 1..<clen {
+                            if utf8[i + k] != cand.bytes[k] { ok = false; break }
+                        }
+                        if ok { matched = cand; break }
+                    }
+                }
+            }
+            if let m = matched {
+                if i > segStart, let segStr = String(bytes: utf8[segStart..<i], encoding: .utf8) {
+                    out.append(contentsOf: encodeSegment(segStr))
+                }
+                out.append(m.id)
+                i += m.bytes.count
+                segStart = i
+            } else {
+                i += 1
+            }
+        }
+        if segStart < n, let segStr = String(bytes: utf8[segStart..<n], encoding: .utf8) {
+            out.append(contentsOf: encodeSegment(segStr))
+        }
+        if !truncation && tokenCache.count < 4096 { tokenCache[text] = out }
+        if truncation, let maxLen = maxLength, out.count > maxLen {
+            return Array(out.prefix(maxLen))
+        }
+        return out
+    }
+}
+
+final class S3L512Engine {
+    let bundleDir: URL
+    let mlmodelcURL: URL
+    let mlConfig: MLModelConfiguration
+    let tokenizer: S3ByteLevelTokenizer
+    private var shapeModels: [Int: MLModel] = [:]
+    let maxLen: Int = 512
+    let headMaxLen: Int = 192
+    let maxOptions: Int = 32
+    let enumeratedLengths: [Int] = [64, 96, 128, 192, 256, 384, 512]
+    var baseTemperature: [Float] = [1.6369, 1.2514, 1.9834]
+    var temperatureByOptions: [String: Float] = [
+        "choice:2": 1.9064,
+        "choice:3-5": 1.7602,
+        "choice:6-10": 1.0000,
+        "choice:11+": 0.5000,
+        "score:3-5": 1.2514,
+        "noul:2": 1.9834,
+    ]
+
+    init(bundlePath: String) throws {
+        self.bundleDir = URL(fileURLWithPath: bundlePath)
+        self.mlmodelcURL = bundleDir.appendingPathComponent("model.mlmodelc")
+        self.tokenizer = try S3ByteLevelTokenizer(mmapPath: bundleDir.appendingPathComponent("tokenizer_mmap.bin").path)
+        let cfg = MLModelConfiguration()
+        cfg.computeUnits = .cpuAndGPU
+        self.mlConfig = cfg
+    }
+
+    private func modelForBucket(_ bucketLen: Int) throws -> MLModel {
+        if let m = shapeModels[bucketLen] { return m }
+        let m = try MLModel(contentsOf: mlmodelcURL, configuration: mlConfig)
+        shapeModels[bucketLen] = m
+        return m
+    }
+
+    func warmupBuckets(_ buckets: [Int] = [96, 128, 192]) throws {
+        for len in buckets {
+            _ = try forwardPass(ids: [tokenizer.clsId, tokenizer.maskId, tokenizer.sepId], markers: [1], qtypeId: 2, forcedBucketLength: len)
+        }
+    }
+
+    func buildSequence(type: String, instructions: String, options: [String], stateIds: [Int]) -> (ids: [Int], markers: [Int], dropped: Int) {
+        let maskTok = tokenizer.maskToken
+        let insClean = instructions.replacingOccurrences(of: maskTok, with: " ")
+        var headIds = tokenizer.encode("\(type) question: \(insClean)")
+        var optIds: [[Int]] = []
+        for opt in options {
+            let optClean = " " + opt.replacingOccurrences(of: maskTok, with: " ")
+            var span = [tokenizer.maskId]
+            span.append(contentsOf: tokenizer.encode(optClean, truncation: true, maxLength: 48))
+            optIds.append(span)
+        }
+        var totalOpt = optIds.reduce(0) { $0 + $1.count }
+        var optBudget = headMaxLen - totalOpt
+        if optBudget < 16 {
+            let per = max(4, (headMaxLen - 16) / max(1, optIds.count))
+            optIds = optIds.map { Array($0.prefix(per)) }
+            totalOpt = optIds.reduce(0) { $0 + $1.count }
+            optBudget = headMaxLen - totalOpt
+        }
+        let headCap = max(8, optBudget)
+        if headIds.count > headCap { headIds = Array(headIds.prefix(headCap)) }
+
+        var ids = [tokenizer.clsId] + headIds + [tokenizer.sepId]
+        var markers: [Int] = []
+        for o in optIds {
+            markers.append(ids.count)
+            ids.append(contentsOf: o)
+        }
+        ids.append(tokenizer.sepId)
+        let room = max(0, maxLen - ids.count - 1)
+        let usedState = stateIds.prefix(room)
+        let dropped = max(0, stateIds.count - usedState.count)
+        ids.append(contentsOf: usedState)
+        ids.append(tokenizer.sepId)
+        if ids.count > maxLen { ids = Array(ids.prefix(maxLen)) }
+        return (ids, markers, dropped)
+    }
+
+    func forwardPass(ids: [Int], markers: [Int], qtypeId: Int, forcedBucketLength: Int? = nil) throws -> (probs: [Float], actProb: Float, bucketLength: Int) {
+        return try autoreleasepool {
+            let validCount = min(ids.count, maxLen)
+            let bucketLen = forcedBucketLength ?? (enumeratedLengths.first(where: { $0 >= validCount }) ?? maxLen)
+            let inputIdsArr   = try MLMultiArray(shape: [1, NSNumber(value: bucketLen)], dataType: .int32)
+            let attMaskArr    = try MLMultiArray(shape: [1, NSNumber(value: bucketLen)], dataType: .int32)
+            let markerPosArr  = try MLMultiArray(shape: [1, 32], dataType: .int32)
+            let markerMaskArr = try MLMultiArray(shape: [1, 32], dataType: .int32)
+            let qtypeArr      = try MLMultiArray(shape: [1], dataType: .int32)
+
+            let idPtr  = inputIdsArr.dataPointer.assumingMemoryBound(to: Int32.self)
+            let attPtr = attMaskArr.dataPointer.assumingMemoryBound(to: Int32.self)
+            let pad32 = Int32(tokenizer.padId)
+            for s in 0..<bucketLen {
+                if s < validCount { idPtr[s] = Int32(ids[s]); attPtr[s] = 1 }
+                else { idPtr[s] = pad32; attPtr[s] = 0 }
+            }
+            let mpPtr = markerPosArr.dataPointer.assumingMemoryBound(to: Int32.self)
+            let mmPtr = markerMaskArr.dataPointer.assumingMemoryBound(to: Int32.self)
+            for opt in 0..<maxOptions {
+                if opt < markers.count { mpPtr[opt] = Int32(markers[opt]); mmPtr[opt] = 1 }
+                else { mpPtr[opt] = 0; mmPtr[opt] = 0 }
+            }
+            qtypeArr.dataPointer.assumingMemoryBound(to: Int32.self)[0] = Int32(qtypeId)
+
+            let provider = try MLDictionaryFeatureProvider(dictionary: [
+                "input_ids": MLFeatureValue(multiArray: inputIdsArr),
+                "attention_mask": MLFeatureValue(multiArray: attMaskArr),
+                "marker_pos": MLFeatureValue(multiArray: markerPosArr),
+                "marker_mask": MLFeatureValue(multiArray: markerMaskArr),
+                "qtype": MLFeatureValue(multiArray: qtypeArr),
+            ])
+            let bucketModel = try modelForBucket(bucketLen)
+            let out = try bucketModel.prediction(from: provider)
+            let k = markers.count
+            var rawLogits = [Float](repeating: -10000.0, count: k)
+            if let lArr = out.featureValue(for: "logits")?.multiArrayValue {
+                let sOpt = lArr.strides.last?.intValue ?? 1
+                let ptr = lArr.dataPointer.assumingMemoryBound(to: Float.self)
+                for i in 0..<k { rawLogits[i] = ptr[i * sOpt] }
+            }
+            var actProb: Float = 0.5
+            if let aArr = out.featureValue(for: "action_logits")?.multiArrayValue {
+                let sA = aArr.strides.last?.intValue ?? 1
+                let ptr = aArr.dataPointer.assumingMemoryBound(to: Float.self)
+                let a0 = ptr[0], a1 = ptr[sA]
+                let m = max(a0, a1)
+                actProb = expf(a0 - m) / (expf(a0 - m) + expf(a1 - m))
+            }
+            let qn = (qtypeId == 0) ? "choice" : ((qtypeId == 1) ? "score" : "noul")
+            let sz = (k <= 2) ? "2" : ((k <= 5) ? "3-5" : ((k <= 10) ? "6-10" : "11+"))
+            let tScale = temperatureByOptions["\(qn):\(sz)"] ?? baseTemperature[qtypeId]
+
+            var maxZ: Float = -Float.infinity
+            var z = [Float](repeating: 0.0, count: k)
+            for i in 0..<k {
+                let v = rawLogits[i] / tScale
+                z[i] = v
+                if v > maxZ { maxZ = v }
+            }
+            var probs = [Float](repeating: 0.0, count: k)
+            var sumP: Float = 0.0
+            for i in 0..<k {
+                let e = expf(z[i] - maxZ)
+                probs[i] = e
+                sumP += e
+            }
+            for i in 0..<k { probs[i] /= sumP }
+            return (probs, actProb, bucketLen)
+        }
+    }
+}
+
 struct QuestionSpec {
     let id: String
     let type: String // "choice", "score", "noul"
@@ -314,6 +619,7 @@ final class S3ANEEngine {
     let typeEmbMMap: MMapFile
     let headsMMap: MMapFile
     let model: MLModel
+    let l512Engine: S3L512Engine?
 
     let maxLen: Int = 96
     let headMaxLen: Int = 256
@@ -389,6 +695,16 @@ final class S3ANEEngine {
         self.srrWout    = hBase.advanced(by: off); off += 32 * 3
         self.srrBout    = hBase.advanced(by: off); off += 3
         self.srrAlpha   = hBase.advanced(by: off)[0]
+
+        // Load Tier-1B Deep Cortex (ModernBERT-large L512) if bundle exists
+        let l512Path = "/Users/mp/decision/models/modernbert_large_l512/swift_bundle"
+        if FileManager.default.fileExists(atPath: l512Path + "/model.mlmodelc"),
+           let tier1b = try? S3L512Engine(bundlePath: l512Path) {
+            try? tier1b.warmupBuckets([96, 128, 192])
+            self.l512Engine = tier1b
+        } else {
+            self.l512Engine = nil
+        }
 
         // Load bundle_config.json for calibration temperatures & binning maps
         let cfgURL = bundleDir.appendingPathComponent("bundle_config.json")
@@ -883,7 +1199,7 @@ final class S3ANEEngine {
         return max(0.0, min(1.0, score))
     }
 
-    func predict(stateAny: Any, questionsRaw: [String: [String: Any]], useRunoff: Bool) throws -> [String: Any] {
+    func predict(stateAny: Any, questionsRaw: [String: [String: Any]], useRunoff: Bool, forceL512: Bool = false) throws -> [String: Any] {
         let stateStr: String
         let truncateLeft: Bool
         if let s = stateAny as? String {
@@ -1023,6 +1339,34 @@ final class S3ANEEngine {
                     ansObj["probabilities"] = avgDict
                     ansObj["choice"] = bestKey
                     ansObj["cyclic_runoff_applied"] = true
+                }
+
+                // Dual-Tier Local Cascade to Tier-1B (`ModernBERT-large` L512) on explicit request,
+                // severe context truncation (>120 state tokens dropped), or Entailment Self-Consistency violation
+                if let tier1b = l512Engine {
+                    let chosenKey = (ansObj["choice"] as? String) ?? keys[bestIdx]
+                    let chosenDesc = item.spec.criteria.first(where: { $0.0 == chosenKey })?.1 ?? ""
+                    let hasSafeBest = item.spec.criteria.contains { $0.1.contains("Safe. Best") || $0.1.contains("Best.") }
+                    let entailmentViolation = hasSafeBest && (chosenDesc.contains("Unsafe.") || chosenDesc.contains("Suboptimal") || chosenDesc.contains("Blocked."))
+                    if forceL512 || item.stateTokensDropped > 120 || entailmentViolation {
+                        let l512StateIds = tier1b.tokenizer.encode(cleanState)
+                        let opts = item.spec.criteria.map { $0.1.isEmpty ? $0.0 : "\($0.0): \($0.1)" }
+                        let (ids512, m512, dropped512) = tier1b.buildSequence(type: "choice", instructions: item.spec.instructions, options: opts, stateIds: l512StateIds)
+                        if let (p512, _, bucket512) = try? tier1b.forwardPass(ids: ids512, markers: m512, qtypeId: 0) {
+                            var p512Dict: [String: Double] = [:]
+                            var bIdx = 0
+                            for i in 0..<k {
+                                p512Dict[keys[i]] = round4(p512[i])
+                                if p512[i] > p512[bIdx] { bIdx = i }
+                            }
+                            ansObj["probabilities"] = p512Dict
+                            ansObj["choice"] = keys[bIdx]
+                            ansObj["tier_used"] = "tier1b_modernbert_large_l\(bucket512)"
+                            maxDropped = min(maxDropped, dropped512)
+                        }
+                    } else {
+                        ansObj["tier_used"] = "tier1a_mmbert_l96_ane"
+                    }
                 }
                 answers[item.qid] = ansObj
             } else if item.spec.type == "score" {
@@ -1222,7 +1566,8 @@ final class S3HTTPServer {
                 "service": "s3-cortexd-swift",
                 "runtime": "native-swift-coreml-mmap",
                 "endpoint": "http://\(host):\(port)",
-                "model": "laya-multilingual-coreml-ane (mmBERT-base 322M FP16 ANE .mlmodelc)",
+                "model": "Dual-Tier S3 Cortex: Tier-1A mmBERT-base (322M L96 ANE) -> Tier-1B ModernBERT-large (420M L512 GPU)",
+                "dual_tier_l512_loaded": engine.l512Engine != nil,
                 "custom_act_head": true,
                 "s3_v2_film_srr_head": true,
                 "calibrated": true,
@@ -1248,11 +1593,12 @@ final class S3HTTPServer {
             let stateAny = bodyObj["state"] ?? ""
             let questionsRaw = (bodyObj["questions"] as? [String: [String: Any]]) ?? [:]
             let useRunoff = (bodyObj["runoff"] as? Bool) ?? false
+            let forceL512 = ((bodyObj["tier"] as? String) == "l512") || ((bodyObj["dual_tier"] as? Bool) == true)
 
             lock.lock()
             let result: [String: Any]
             do {
-                var out = try engine.predict(stateAny: stateAny, questionsRaw: questionsRaw, useRunoff: useRunoff)
+                var out = try engine.predict(stateAny: stateAny, questionsRaw: questionsRaw, useRunoff: useRunoff, forceL512: forceL512)
                 let dtMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
                 callsServed += 1
                 latencies.append(dtMs)
@@ -1277,63 +1623,69 @@ final class S3HTTPServer {
 
 // MARK: - CLI Entrypoint
 
-var host = "127.0.0.1"
-var port: UInt16 = 8765
-var bundlePath = "/Users/mp/decision/models/snake/swift_bundle"
-var pidFile = "/Users/mp/decision/.laya_system1d.pid"
-var benchOnce = false
+@main
+struct S3CortexDaemonApp {
+    static func main() throws {
+        var host = "127.0.0.1"
+        var port: UInt16 = 8765
+        var bundlePath = "/Users/mp/decision/models/snake/swift_bundle"
+        var pidFile = "/Users/mp/decision/.laya_system1d.pid"
+        var benchOnce = false
 
-var args = Array(CommandLine.arguments.dropFirst())
-var i = 0
-while i < args.count {
-    switch args[i] {
-    case "--host":
-        if i + 1 < args.count { host = args[i + 1]; i += 1 }
-    case "--port":
-        if i + 1 < args.count { port = UInt16(args[i + 1]) ?? 8765; i += 1 }
-    case "--bundle":
-        if i + 1 < args.count { bundlePath = args[i + 1]; i += 1 }
-    case "--pid-file":
-        if i + 1 < args.count { pidFile = args[i + 1]; i += 1 }
-    case "--bench-once":
-        benchOnce = true
-    default:
-        break
+        let args = Array(CommandLine.arguments.dropFirst())
+        var i = 0
+        while i < args.count {
+            switch args[i] {
+            case "--host":
+                if i + 1 < args.count { host = args[i + 1]; i += 1 }
+            case "--port":
+                if i + 1 < args.count { port = UInt16(args[i + 1]) ?? 8765; i += 1 }
+            case "--bundle":
+                if i + 1 < args.count { bundlePath = args[i + 1]; i += 1 }
+            case "--pid-file":
+                if i + 1 < args.count { pidFile = args[i + 1]; i += 1 }
+            case "--bench-once":
+                benchOnce = true
+            default:
+                break
+            }
+            i += 1
+        }
+
+        let tBoot0 = DispatchTime.now().uptimeNanoseconds
+        let engine = try S3ANEEngine(bundlePath: bundlePath)
+        _ = try engine.predict(
+            stateAny: "warmup",
+            questionsRaw: ["q": ["type": "noul", "instructions": "Warmup?"]],
+            useRunoff: false
+        )
+        let warmupMs = Double(DispatchTime.now().uptimeNanoseconds - tBoot0) / 1_000_000.0
+
+        if benchOnce {
+            let srv = S3HTTPServer(host: host, port: port, engine: engine, warmupMs: warmupMs)
+            let (dirtyMB, rssMB) = srv.residentDirtyAndRSSMB()
+            let info: [String: Any] = [
+                "cold_boot_and_warmup_ms": (warmupMs * 100.0).rounded() / 100.0,
+                "dual_tier_l512_loaded": engine.l512Engine != nil,
+                "dirty_ram_mb": (dirtyMB * 100.0).rounded() / 100.0,
+                "rss_mb": (rssMB * 100.0).rounded() / 100.0,
+            ]
+            let d = try JSONSerialization.data(withJSONObject: info, options: [])
+            print(String(data: d, encoding: .utf8)!)
+            exit(0)
+        }
+
+        try? "\(getpid())".write(toFile: pidFile, atomically: true, encoding: .utf8)
+        signal(SIGTERM) { _ in
+            unlink("/Users/mp/decision/.laya_system1d.pid")
+            exit(0)
+        }
+        signal(SIGINT) { _ in
+            unlink("/Users/mp/decision/.laya_system1d.pid")
+            exit(0)
+        }
+
+        let server = S3HTTPServer(host: host, port: port, engine: engine, warmupMs: warmupMs)
+        try server.serveForever()
     }
-    i += 1
 }
-
-let tBoot0 = DispatchTime.now().uptimeNanoseconds
-let engine = try S3ANEEngine(bundlePath: bundlePath)
-_ = try engine.predict(
-    stateAny: "warmup",
-    questionsRaw: ["q": ["type": "noul", "instructions": "Warmup?"]],
-    useRunoff: false
-)
-let warmupMs = Double(DispatchTime.now().uptimeNanoseconds - tBoot0) / 1_000_000.0
-
-if benchOnce {
-    let srv = S3HTTPServer(host: host, port: port, engine: engine, warmupMs: warmupMs)
-    let (dirtyMB, rssMB) = srv.residentDirtyAndRSSMB()
-    let info: [String: Any] = [
-        "cold_boot_and_warmup_ms": (warmupMs * 100.0).rounded() / 100.0,
-        "dirty_ram_mb": (dirtyMB * 100.0).rounded() / 100.0,
-        "rss_mb": (rssMB * 100.0).rounded() / 100.0,
-    ]
-    let d = try JSONSerialization.data(withJSONObject: info, options: [])
-    print(String(data: d, encoding: .utf8)!)
-    exit(0)
-}
-
-try? "\(getpid())".write(toFile: pidFile, atomically: true, encoding: .utf8)
-signal(SIGTERM) { _ in
-    unlink("/Users/mp/decision/.laya_system1d.pid")
-    exit(0)
-}
-signal(SIGINT) { _ in
-    unlink("/Users/mp/decision/.laya_system1d.pid")
-    exit(0)
-}
-
-let server = S3HTTPServer(host: host, port: port, engine: engine, warmupMs: warmupMs)
-try server.serveForever()

@@ -854,3 +854,350 @@ public struct S3SplitMix64 {
         }
     }
 }
+
+// MARK: - 8. Zero-Copy Memory-Mapped ByteLevel BPE Tokenizer (`ModernBERT-large` L512)
+
+public final class S3ByteLevelTokenizer {
+    private let mmapFile: MMapFile
+    private let mergeCap: Int
+    private let mergeMask: UInt64
+    private let byteToIdPtr: UnsafePointer<UInt32>
+    private let mergeTablePtr: UnsafePointer<S3MergeSlot>
+    private var addedTokens: [S3AddedToken] = []
+    private var tokenCache: [String: [Int]] = [:]
+    private let regex: NSRegularExpression
+
+    public let unkId: Int = 50280
+    public let clsId: Int
+    public let sepId: Int
+    public let padId: Int
+    public let maskId: Int
+    public let maskToken: String = "[MASK]"
+
+    public init(mmapPath: String) throws {
+        self.mmapFile = try MMapFile(path: mmapPath)
+        let base = mmapFile.rawPtr
+        let headerU32 = base.assumingMemoryBound(to: UInt32.self)
+        let version = Int(headerU32[1])
+        guard version == 1 else {
+            throw NSError(domain: "S3Core", code: 80, userInfo: [NSLocalizedDescriptionKey: "Unsupported S3BL version \(version)"])
+        }
+        self.mergeCap = Int(headerU32[2])
+        self.mergeMask = UInt64(mergeCap - 1)
+        let numAdded = Int(headerU32[3])
+        self.clsId  = Int(headerU32[4])
+        self.sepId  = Int(headerU32[5])
+        self.padId  = Int(headerU32[6])
+        self.maskId = Int(headerU32[7])
+
+        var offset = 32
+        self.byteToIdPtr = base.advanced(by: offset).assumingMemoryBound(to: UInt32.self)
+        offset += 256 * 4
+        self.mergeTablePtr = base.advanced(by: offset).assumingMemoryBound(to: S3MergeSlot.self)
+        offset += mergeCap * 16
+
+        var list: [S3AddedToken] = []
+        list.reserveCapacity(numAdded)
+        for _ in 0..<numAdded {
+            let tid = Int(base.loadUnaligned(fromByteOffset: offset, as: UInt32.self))
+            let flags = base.loadUnaligned(fromByteOffset: offset + 4, as: UInt8.self)
+            let blen = Int(base.loadUnaligned(fromByteOffset: offset + 5, as: UInt16.self))
+            offset += 7
+            let bptr = base.advanced(by: offset).assumingMemoryBound(to: UInt8.self)
+            let bytes = Array(UnsafeBufferPointer(start: bptr, count: blen))
+            offset += blen
+            if let s = String(bytes: bytes, encoding: .utf8), !s.isEmpty {
+                list.append(S3AddedToken(bytes: bytes, str: s, id: tid, lstrip: (flags & 2) != 0))
+            }
+        }
+        self.addedTokens = list
+        self.regex = try NSRegularExpression(
+            pattern: #"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"#,
+            options: []
+        )
+    }
+
+    @inline(__always)
+    private func lookupMerge(_ leftId: Int, _ rightId: Int) -> (rank: UInt32, mergedId: Int)? {
+        let key = (UInt64(UInt32(leftId)) << 32) | UInt64(UInt32(rightId))
+        var h = ((key &* 11400714819323198485) >> 46) & mergeMask
+        while true {
+            let slot = mergeTablePtr[Int(h)]
+            if slot.key == 0 { return nil }
+            if slot.key == key { return (slot.rank, Int(slot.mergedId)) }
+            h = (h &+ 1) & mergeMask
+        }
+    }
+
+    private func bpeBytes(_ utf8: ArraySlice<UInt8>) -> [Int] {
+        if utf8.isEmpty { return [] }
+        var syms = utf8.map { Int(byteToIdPtr[Int($0)]) }
+        while syms.count >= 2 {
+            var bestRank: UInt32 = UInt32.max
+            var bestIdx: Int = -1
+            var bestMerged: Int = -1
+            for i in 0..<(syms.count - 1) {
+                if let info = lookupMerge(syms[i], syms[i + 1]), info.rank < bestRank {
+                    bestRank = info.rank
+                    bestIdx = i
+                    bestMerged = info.mergedId
+                }
+            }
+            if bestIdx < 0 { break }
+            syms[bestIdx] = bestMerged
+            syms.remove(at: bestIdx + 1)
+        }
+        return syms
+    }
+
+    private func encodeSegment(_ seg: String) -> [Int] {
+        if seg.isEmpty { return [] }
+        let ns = seg as NSString
+        let matches = regex.matches(in: seg, options: [], range: NSRange(location: 0, length: ns.length))
+        var out: [Int] = []
+        for m in matches {
+            let piece = ns.substring(with: m.range)
+            let bytes = Array(piece.utf8)
+            out.append(contentsOf: bpeBytes(bytes[0..<bytes.count]))
+        }
+        return out
+    }
+
+    public func encode(_ text: String, truncation: Bool = false, maxLength: Int? = nil) -> [Int] {
+        if text.isEmpty { return [] }
+        if !truncation, let cached = tokenCache[text] { return cached }
+        let utf8 = Array(text.utf8)
+        let n = utf8.count
+        var i = 0
+        var segStart = 0
+        var out: [Int] = []
+
+        while i < n {
+            var matched: S3AddedToken? = nil
+            let b0 = utf8[i]
+            if b0 == 32 || b0 == 60 || b0 == 91 || b0 == 124 {
+                for cand in addedTokens {
+                    let clen = cand.bytes.count
+                    if i + clen <= n && cand.bytes[0] == b0 {
+                        if b0 == 32 && clen >= 2 {
+                            let afterIdx = i + clen
+                            if afterIdx < n && utf8[afterIdx] != 32 {
+                                continue
+                            }
+                        }
+                        var ok = true
+                        for k in 1..<clen {
+                            if utf8[i + k] != cand.bytes[k] { ok = false; break }
+                        }
+                        if ok { matched = cand; break }
+                    }
+                }
+            }
+            if let m = matched {
+                if i > segStart, let segStr = String(bytes: utf8[segStart..<i], encoding: .utf8) {
+                    out.append(contentsOf: encodeSegment(segStr))
+                }
+                out.append(m.id)
+                i += m.bytes.count
+                segStart = i
+            } else {
+                i += 1
+            }
+        }
+        if segStart < n, let segStr = String(bytes: utf8[segStart..<n], encoding: .utf8) {
+            out.append(contentsOf: encodeSegment(segStr))
+        }
+        if !truncation && tokenCache.count < 4096 {
+            tokenCache[text] = out
+        }
+        if truncation, let maxLen = maxLength, out.count > maxLen {
+            return Array(out.prefix(maxLen))
+        }
+        return out
+    }
+}
+
+// MARK: - 9. Tier-1B Deep Cortex Engine (`ModernBERT-large` 420M L512 Enumerated Shapes)
+
+public final class S3L512Engine {
+    public let bundleDir: URL
+    public let mlmodelcURL: URL
+    public let mlConfig: MLModelConfiguration
+    public let tokenizer: S3ByteLevelTokenizer
+    private var shapeModels: [Int: MLModel] = [:]
+    public let maxLen: Int = 512
+    public let headMaxLen: Int = 192
+    public let maxOptions: Int = 32
+    public let enumeratedLengths: [Int] = [64, 96, 128, 192, 256, 384, 512]
+    public var baseTemperature: [Float] = [1.6369, 1.2514, 1.9834]
+    public var temperatureByOptions: [String: Float] = [
+        "choice:2": 1.9064,
+        "choice:3-5": 1.7602,
+        "choice:6-10": 1.0000,
+        "choice:11+": 0.5000,
+        "score:3-5": 1.2514,
+        "noul:2": 1.9834,
+    ]
+
+    public init(bundlePath: String = "/Users/mp/decision/models/modernbert_large_l512/swift_bundle") throws {
+        self.bundleDir = URL(fileURLWithPath: bundlePath)
+        self.mlmodelcURL = bundleDir.appendingPathComponent("model.mlmodelc")
+        self.tokenizer = try S3ByteLevelTokenizer(mmapPath: bundleDir.appendingPathComponent("tokenizer_mmap.bin").path)
+        let cfg = MLModelConfiguration()
+        cfg.computeUnits = .cpuAndGPU
+        self.mlConfig = cfg
+    }
+
+    private func modelForBucket(_ bucketLen: Int) throws -> MLModel {
+        if let m = shapeModels[bucketLen] {
+            return m
+        }
+        let m = try MLModel(contentsOf: mlmodelcURL, configuration: mlConfig)
+        shapeModels[bucketLen] = m
+        return m
+    }
+
+    /// Pre-warms dedicated per-shape `MLModel` instances so runtime predictions never trigger MPSGraph reshaping
+    public func warmupBuckets(_ buckets: [Int] = [96, 128, 192]) throws {
+        for len in buckets {
+            _ = try forwardPass(ids: [tokenizer.clsId, tokenizer.maskId, tokenizer.sepId], markers: [1], qtypeId: 2, forcedBucketLength: len)
+        }
+    }
+
+    public func buildSequence(type: String, instructions: String, options: [String], stateIds: [Int]) -> (ids: [Int], markers: [Int], dropped: Int) {
+        let maskTok = tokenizer.maskToken
+        let insClean = instructions.replacingOccurrences(of: maskTok, with: " ")
+        var headIds = tokenizer.encode("\(type) question: \(insClean)")
+
+        var optIds: [[Int]] = []
+        optIds.reserveCapacity(options.count)
+        for opt in options {
+            let optClean = " " + opt.replacingOccurrences(of: maskTok, with: " ")
+            var span = [tokenizer.maskId]
+            span.append(contentsOf: tokenizer.encode(optClean, truncation: true, maxLength: 48))
+            optIds.append(span)
+        }
+
+        var totalOpt = optIds.reduce(0) { $0 + $1.count }
+        var optBudget = headMaxLen - totalOpt
+        if optBudget < 16 {
+            let per = max(4, (headMaxLen - 16) / max(1, optIds.count))
+            optIds = optIds.map { Array($0.prefix(per)) }
+            totalOpt = optIds.reduce(0) { $0 + $1.count }
+            optBudget = headMaxLen - totalOpt
+        }
+        let headCap = max(8, optBudget)
+        if headIds.count > headCap { headIds = Array(headIds.prefix(headCap)) }
+
+        var ids = [tokenizer.clsId]
+        ids.append(contentsOf: headIds)
+        ids.append(tokenizer.sepId)
+        var markers: [Int] = []
+        for o in optIds {
+            markers.append(ids.count)
+            ids.append(contentsOf: o)
+        }
+        ids.append(tokenizer.sepId)
+
+        let room = max(0, maxLen - ids.count - 1)
+        let usedState = stateIds.prefix(room)
+        let dropped = max(0, stateIds.count - usedState.count)
+        ids.append(contentsOf: usedState)
+        ids.append(tokenizer.sepId)
+        if ids.count > maxLen { ids = Array(ids.prefix(maxLen)) }
+        return (ids, markers, dropped)
+    }
+
+    public func forwardPass(ids: [Int], markers: [Int], qtypeId: Int, forcedBucketLength: Int? = nil) throws -> (probs: [Float], actProb: Float, bucketLength: Int) {
+        return try autoreleasepool {
+            let validCount = min(ids.count, maxLen)
+            let bucketLen = forcedBucketLength ?? (enumeratedLengths.first(where: { $0 >= validCount }) ?? maxLen)
+
+            let inputIdsArr = try MLMultiArray(shape: [1, NSNumber(value: bucketLen)], dataType: .int32)
+            let attMaskArr  = try MLMultiArray(shape: [1, NSNumber(value: bucketLen)], dataType: .int32)
+            let markerPosArr  = try MLMultiArray(shape: [1, 32], dataType: .int32)
+            let markerMaskArr = try MLMultiArray(shape: [1, 32], dataType: .int32)
+            let qtypeArr      = try MLMultiArray(shape: [1], dataType: .int32)
+
+            let idPtr  = inputIdsArr.dataPointer.assumingMemoryBound(to: Int32.self)
+            let attPtr = attMaskArr.dataPointer.assumingMemoryBound(to: Int32.self)
+            let pad32 = Int32(tokenizer.padId)
+            for s in 0..<bucketLen {
+                if s < validCount {
+                    idPtr[s] = Int32(ids[s])
+                    attPtr[s] = 1
+                } else {
+                    idPtr[s] = pad32
+                    attPtr[s] = 0
+                }
+            }
+
+            let mpPtr = markerPosArr.dataPointer.assumingMemoryBound(to: Int32.self)
+            let mmPtr = markerMaskArr.dataPointer.assumingMemoryBound(to: Int32.self)
+            for opt in 0..<maxOptions {
+                if opt < markers.count {
+                    mpPtr[opt] = Int32(markers[opt])
+                    mmPtr[opt] = 1
+                } else {
+                    mpPtr[opt] = 0
+                    mmPtr[opt] = 0
+                }
+            }
+            qtypeArr.dataPointer.assumingMemoryBound(to: Int32.self)[0] = Int32(qtypeId)
+
+            let provider = try MLDictionaryFeatureProvider(dictionary: [
+                "input_ids": MLFeatureValue(multiArray: inputIdsArr),
+                "attention_mask": MLFeatureValue(multiArray: attMaskArr),
+                "marker_pos": MLFeatureValue(multiArray: markerPosArr),
+                "marker_mask": MLFeatureValue(multiArray: markerMaskArr),
+                "qtype": MLFeatureValue(multiArray: qtypeArr),
+            ])
+
+            let bucketModel = try modelForBucket(bucketLen)
+            let out = try bucketModel.prediction(from: provider)
+            let k = markers.count
+            var rawLogits = [Float](repeating: -10000.0, count: k)
+            if let lArr = out.featureValue(for: "logits")?.multiArrayValue {
+                let sOpt = lArr.strides.last?.intValue ?? 1
+                let ptr = lArr.dataPointer.assumingMemoryBound(to: Float.self)
+                for i in 0..<k { rawLogits[i] = ptr[i * sOpt] }
+            }
+
+            var actProb: Float = 0.5
+            if let aArr = out.featureValue(for: "action_logits")?.multiArrayValue {
+                let sA = aArr.strides.last?.intValue ?? 1
+                let ptr = aArr.dataPointer.assumingMemoryBound(to: Float.self)
+                let a0 = ptr[0]
+                let a1 = ptr[sA]
+                let m = max(a0, a1)
+                let e0 = expf(a0 - m)
+                let e1 = expf(a1 - m)
+                actProb = e0 / (e0 + e1)
+            }
+
+            let qn = (qtypeId == 0) ? "choice" : ((qtypeId == 1) ? "score" : "noul")
+            let sz = (k <= 2) ? "2" : ((k <= 5) ? "3-5" : ((k <= 10) ? "6-10" : "11+"))
+            let bucket = "\(qn):\(sz)"
+            let tScale = temperatureByOptions[bucket] ?? baseTemperature[qtypeId]
+
+            var maxZ: Float = -Float.infinity
+            var z = [Float](repeating: 0.0, count: k)
+            for i in 0..<k {
+                let v = rawLogits[i] / tScale
+                z[i] = v
+                if v > maxZ { maxZ = v }
+            }
+            var probs = [Float](repeating: 0.0, count: k)
+            var sumP: Float = 0.0
+            for i in 0..<k {
+                let e = expf(z[i] - maxZ)
+                probs[i] = e
+                sumP += e
+            }
+            for i in 0..<k { probs[i] /= sumP }
+
+            return (probs, actProb, bucketLen)
+        }
+    }
+}
+
