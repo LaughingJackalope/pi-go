@@ -183,6 +183,7 @@ sequenceDiagram
 | [`pi-go/internal/sense/capacitor_router.go`](file:///Users/mp/decision/pi-go/internal/sense/capacitor_router.go) | `BeforeModelCallback` Capacitor Router (`smol` $\leftrightarrow$ `slow` dynamic per-step model shifter driven by posture & ANE `act_head`) + ~380-token S3 Clone Handover Capsule transcript compactor. | **<0.3 ms**, **-85.8% cloud token burn** |
 | [`pi-go/internal/sense/blast_radius.go`](file:///Users/mp/decision/pi-go/internal/sense/blast_radius.go) | Cross-File & Cross-Service Blast-Radius Scanner + Unsoundness-Aware Symbolic Predicate detector (`getattr`, `**kwargs`, `reflect.ValueOf`, `MethodByName`). | **<5.0 ms**, **0 cloud tokens** |
 | [`s3_v2_research_bench.py`](file:///Users/mp/decision/s3_v2_research_bench.py) & [`portal_s3_v2_film_srr_head.npz`](file:///Users/mp/decision/portal_s3_v2_film_srr_head.npz) | **S3 v2 Literature-Hardened Upgrade Suite:** Dual-Stream Bounded FiLM + 3-Head Signed Rescue Routing (`rescue`, `harm`, `ambig`) + Cyclic Position-Balanced Runoff. | **70.1 ms** pure-NumPy train time; **0 extra ANE calls** |
+| [`s3_cortexd.swift`](file:///Users/mp/decision/s3_cortexd.swift) & [`export_swift_bundle.py`](file:///Users/mp/decision/export_swift_bundle.py) | **Native Swift S3 Cortex Daemon (`s3-cortexd`):** Direct `CoreML.framework` (`.mlmodelc`) + `Accelerate.framework` (`vDSP`) + zero-copy `mmap()` of 375 MB FP16 embeddings (`tok_embeddings.fp16.bin`) and 34 MB $O(1)$ BPE merge table (`tokenizer_mmap.bin`). | **172–415 ms** cold-boot (**62×–150× faster**); **16.3 MB** dirty RAM; **5.75 ms** min / **6.33 ms** P50 1-question ANE latency |
 
 ---
 
@@ -205,7 +206,7 @@ Following our literature grounding review ([Neuro-Symbolic Coding Agent Architec
    - Because $\gamma, \beta \in [-\alpha, +\alpha]^{32}$, even a $3.5\times$ Out-of-Distribution (OOD) shift in $\|h_{\text{CLS}}\|_2$ cannot swamp the calibrated uncertainty stream $z_u$.
 
 3. **"Consider, Then Choose" Cyclic Position-Balanced Runoff (`arXiv:2610.18233`):**
-   - Single-pass joint encoders exhibit a 12%–28% answer flip rate when option listing order is permuted (`Crivo`, `arXiv:2610.30970`). Whenever the top-2 option margin $p_{(1)} - p_{(2)} < 0.18$, [`laya_system1d.py`](file:///Users/mp/decision/laya_system1d.py#L178-L192) automatically executes a cyclic option-order permutation pass on the M2 ANE and averages the de-biased probabilities.
+   - Single-pass joint encoders exhibit a 12%–28% answer flip rate when option listing order is permuted (`Crivo`, `arXiv:2610.30970`). Whenever the top-2 option margin $p_{(1)} - p_{(2)} < 0.18$, [`laya_system1d.py`](file:///Users/mp/decision/laya_system1d.py#L178-L192) and [`s3_cortexd.swift`](file:///Users/mp/decision/s3_cortexd.swift#L696-L736) automatically execute a cyclic option-order permutation pass on the M2 ANE and average the de-biased probabilities.
 
 4. **Unsoundness-Aware Symbolic Predicates (`CodeAnchor` ISSTA 2026 / `CaMeLoT`, `arXiv:2609.18674`):**
    - [`blast_radius.go`](file:///Users/mp/decision/pi-go/internal/sense/blast_radius.go#L259-L271) detects dynamic dispatch and reflection (`getattr`, `setattr`, `**kwargs`, `eval` in Python; `reflect.ValueOf`, `MethodByName`, `.(any)` in Go) and emits `"Static analysis incomplete: yes"` into the System 1 state predicate—preventing "0 static callers found" on dynamic code from causing a false-certainty cascade.
@@ -223,4 +224,32 @@ Following our literature grounding review ([Neuro-Symbolic Coding Agent Architec
 | **2. OOD-Damped Bounded FiLM Fusion**<br/>Failure Mode 3 ($3.5\times$ OOD `[CLS]` Drift) | Decision Flip Rate Under $3.5\times$ OOD Shift | `15 / 22` (`68.2%`) | **`0 / 22` (`0.0%`)** | **-68.2 pp OOD Instability (0% flips)** |
 | **3. Cyclic Position-Balanced Runoff**<br/>`arXiv:2610.18233` (`Crivo` Order Bias) | Option-Order Flip Rate (18 Permutations) | `6 / 18` (`33.3%`) | **`0 / 18` (`0.0%`)** | **0.0% Option-Order Flip Rate** |
 | **4 & 5. Unsoundness + Role-Stratified CRC**<br/>`CodeAnchor` + `arXiv:2607.24343` | Dynamic Dispatch (`getattr`, `**kwargs`) with 0 Static Callers | False `LOCAL` certainty | **`TIER2_HIGH_BLAST_OR_DYNAMIC` (`SignedGain=+0.83`, `Rescue=0.95` -> `slow`)** | **Eliminates Static Unsoundness Blind Spot** |
+
+---
+
+## 7. Native Swift S3 Cortex Daemon (`s3-cortexd`) vs. Python (`laya-system1d`)
+
+Because Project `decision` is native to Apple Silicon (`darwin/arm64`), we implemented a single-file, zero-external-dependency Swift daemon ([`s3_cortexd.swift`](file:///Users/mp/decision/s3_cortexd.swift)) alongside an offline bundle compiler ([`export_swift_bundle.py`](file:///Users/mp/decision/export_swift_bundle.py)) and benchmarked it head-to-head against [`laya_system1d.py`](file:///Users/mp/decision/laya_system1d.py) ([`swift_vs_python_bench.py`](file:///Users/mp/decision/swift_vs_python_bench.py)).
+
+### 7.1 Architectural Optimizations in `s3-cortexd`
+
+1. **Ahead-of-Time `.mlmodelc` Compilation:** Pre-compiles `model.mlpackage` into `swift_bundle/model.mlmodelc` via `xcrun coremlcompiler compile`, eliminating Python + `coremltools` runtime MIL compilation on startup.
+2. **Zero-Copy `mmap()` of 375 MB FP16 Embeddings (`tok_embeddings.fp16.bin`):** Instead of allocating a ~393 MB private NumPy heap array (`self.embedding`), `s3-cortexd` maps `tok_embeddings.fp16.bin` (`[256000, 768]` `Float16`) with `mmap(..., PROT_READ, MAP_SHARED)`. On Apple M2 Unified Memory, the OS page cache backs the lookup table directly with **0 MB of dirty heap allocation**.
+3. **Zero-Copy $O(1)$ Memory-Mapped BPE Tokenizer (`tokenizer_mmap.bin`):** Notice that BPE tokenization only ever queries single Unicode scalars at the character split stage and `(left_id, right_id)` pairs during merge iterations. [`export_swift_bundle.py`](file:///Users/mp/decision/export_swift_bundle.py) pre-builds two flat, power-of-2 open-addressed hash tables directly inside `tokenizer_mmap.bin`:
+   - `char_table` ($2^{18} = 262,144$ slots $\times 8\text{ B} = 2.0\text{ MB}$) for all 20,722 single-character Unicode tokens.
+   - `merge_table` ($2^{21} = 2,097,152$ slots $\times 16\text{ B} = 33.5\text{ MB}$) for all 580,604 BPE merge pairs `(key: UInt64, rank: UInt32, merged_id: UInt32)`.
+   - `s3-cortexd` `mmap()`s `tokenizer_mmap.bin` in `<0.1 ms` with zero string-dictionary allocations and achieves **100% bit-exact token ID parity** across all 23 test cases.
+4. **Pre-Allocated Unified-Memory `MLMultiArray` Buffers + `Accelerate` (`vDSP`):** Pre-allocates the 5 static CoreML inputs (`embeddings`, `full_mask`, `local_mask`, `type_vectors`, `marker_map`), populates them via stride-aware `UnsafeMutablePointer<Float16>` writes, and executes the `act_head` and S3 v2 Hyperspherical RMSNorm + Bounded FiLM + SRR head using Apple's `Accelerate` framework.
+
+### 7.2 Head-to-Head Benchmark Results on M2 MacBook Air (24 GB)
+
+| Metric | Python (`laya_system1d.py`) | Native Swift (`s3-cortexd`) | Speedup / Savings |
+| :--- | :---: | :---: | :---: |
+| **Cold-Boot + ANE First-Inference Warmup** | `25,870.1 ms` | **`172.1 ms` – `415.8 ms`** | **62.2× – 150.3× faster cold boot** |
+| **Process Dirty Memory (Private Heap)** | `~395 MB` active (`48.9 MB` post-swap) | **`16.3 MB` – `20.4 MB`** | **3.0× – 24.2× less dirty RAM** |
+| **1-Question (`choice`) ANE Latency (Min / P50 / P95)** | `6.77 / 7.75 / 14.77 ms` | **`5.75 / 6.33 / 17.36 ms`** | **1.22× faster P50 (`-1.42 ms`)** |
+| **3-Question S3 Triad (`/v1/systemone`) (Min / P50 / P95)** | `19.67 / 23.70 / 32.43 ms` | **`17.56 / 18.28 / 25.95 ms`** | **1.20× – 1.30× faster P50 (`-5.42 ms`)** |
+| **Numerical & Decision Parity (5 S3 Triad Scenarios)** | Reference (`100%`) | **`5 / 5` (`100%`) · $\max |\Delta p| = 0.0000$** | **Bit-Exact 4-Decimal Parity** |
+| **`pi-go/internal/sense` Full Go Integration Suite** | `PASS` (`0.851s`) | **`PASS` (`0.905s`)** | **Drop-in Wire-Compatible on `:8765`** |
+
 
