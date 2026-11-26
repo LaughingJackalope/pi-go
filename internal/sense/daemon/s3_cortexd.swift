@@ -600,6 +600,7 @@ final class S3ANEEngine {
     ///   - `actProbLegacy`: legacy 2-layer `act_head` softmax probability (`Float`)
     ///   - `vec772`: `[pooled(768) || features(4)]` (`[Float]`) for our S3 v2 FiLM+SRR head
     func forwardANE(item: EncodedItem) throws -> (logits: [Float], actProbLegacy: Float, vec772: [Float]) {
+        return try autoreleasepool {
         let validCount = item.ids.count
         let tokEmbBase = tokEmbMMap.rawPtr.assumingMemoryBound(to: Float16.self)
         let typeEmbBase = typeEmbMMap.rawPtr.assumingMemoryBound(to: Float16.self)
@@ -773,6 +774,7 @@ final class S3ANEEngine {
         let actProbLegacy = e0 / (e0 + e1)
 
         return (rawLogits, actProbLegacy, vec772)
+        }
     }
 
     /// Evaluates S3 v2 Hyperspherical RMSNorm + Bounded FiLM + Signed Rescue Routing head on `vec772`

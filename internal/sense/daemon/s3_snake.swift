@@ -778,6 +778,7 @@ final class S3SnakePolicy {
     }
 
     func forwardPass(ids: [Int], markers: [Int], qtypeId: Int) throws -> (probs: [Float], pooled: [Float]) {
+        return try autoreleasepool {
         let validCount = min(ids.count, maxLen)
         let tokEmbBase = tokEmbMMap.rawPtr.assumingMemoryBound(to: Float16.self)
         let typeEmbBase = typeEmbMMap.rawPtr.assumingMemoryBound(to: Float16.self)
@@ -894,6 +895,7 @@ final class S3SnakePolicy {
         }
         for i in 0..<k { probs[i] /= sumP }
         return (probs, pooled)
+        }
     }
 
     func decide(game: SnakeGame) throws -> SnakeDecision {
@@ -1284,54 +1286,63 @@ var totalSteps = 0
 var infSum = 0.0
 var recentTimestamps: [Double] = []
 
-while true {
+var shouldBreakLoop = false
+while !shouldBreakLoop {
     if let limit = maxSteps, totalSteps >= limit { break }
-    let tNow = DispatchTime.now().uptimeNanoseconds
-    if let k = term?.readKey().lowercased(), !k.isEmpty {
-        if k.contains("q") || k.contains("\u{03}") { break }
-        if k.contains(" ") { stats.paused.toggle() }
-        if k.contains("+") || k.contains("\u{1B}[a") { fps = min(240.0, fps + 4.0) }
-        if k.contains("-") || k.contains("\u{1B}[b") { fps = max(1.0, fps - 4.0) }
-        if k.contains("r") {
+    try autoreleasepool {
+        let tNow = DispatchTime.now().uptimeNanoseconds
+        if let k = term?.readKey().lowercased(), !k.isEmpty {
+            if k.contains("q") || k.contains("\u{03}") {
+                shouldBreakLoop = true
+                return
+            }
+            if k.contains(" ") { stats.paused.toggle() }
+            if k.contains("+") || k.contains("\u{1B}[a") { fps = min(240.0, fps + 4.0) }
+            if k.contains("-") || k.contains("\u{1B}[b") { fps = max(1.0, fps - 4.0) }
+            if k.contains("r") {
+                stats.round += 1
+                game = SnakeGame(width: 24, height: 16, seed: seed + stats.round - 1, initialLength: 6)
+            }
+        }
+        if stats.paused {
+            Thread.sleep(forTimeInterval: 0.03)
+            return
+        }
+
+        let decision = try policy.decide(game: game)
+        infSum += decision.inferenceMs
+        if decision.intervened { stats.interventions += 1 }
+        let nowSec = Double(DispatchTime.now().uptimeNanoseconds - tStart) / 1_000_000_000.0
+        recentTimestamps.append(nowSec)
+        if recentTimestamps.count > 60 { recentTimestamps.removeFirst() }
+        stats.elapsed = nowSec
+        if recentTimestamps.count > 1 {
+            stats.stepsPerSecond = Double(recentTimestamps.count - 1) / max(1e-6, recentTimestamps.last! - recentTimestamps.first!)
+        }
+        stats.best = max(stats.best, game.score)
+
+        if !headless {
+            let ansi = canvas.renderANSI(game: game, decision: decision, stats: stats)
+            FileHandle.standardOutput.write(Data(ansi.utf8))
+        }
+
+        if !maxSpeed {
+            let tickElapsed = Double(DispatchTime.now().uptimeNanoseconds - tNow) / 1_000_000_000.0
+            let rem = (1.0 / fps) - tickElapsed
+            if rem > 0 { Thread.sleep(forTimeInterval: rem) }
+        }
+
+        game.step(decision.executed)
+        totalSteps += 1
+        stats.best = max(stats.best, game.score)
+        if !game.alive || game.won {
+            if unassisted {
+                shouldBreakLoop = true
+                return
+            }
             stats.round += 1
             game = SnakeGame(width: 24, height: 16, seed: seed + stats.round - 1, initialLength: 6)
         }
-    }
-    if stats.paused {
-        Thread.sleep(forTimeInterval: 0.03)
-        continue
-    }
-
-    let decision = try policy.decide(game: game)
-    infSum += decision.inferenceMs
-    if decision.intervened { stats.interventions += 1 }
-    let nowSec = Double(DispatchTime.now().uptimeNanoseconds - tStart) / 1_000_000_000.0
-    recentTimestamps.append(nowSec)
-    if recentTimestamps.count > 60 { recentTimestamps.removeFirst() }
-    stats.elapsed = nowSec
-    if recentTimestamps.count > 1 {
-        stats.stepsPerSecond = Double(recentTimestamps.count - 1) / max(1e-6, recentTimestamps.last! - recentTimestamps.first!)
-    }
-    stats.best = max(stats.best, game.score)
-
-    if !headless {
-        let ansi = canvas.renderANSI(game: game, decision: decision, stats: stats)
-        FileHandle.standardOutput.write(Data(ansi.utf8))
-    }
-
-    if !maxSpeed {
-        let tickElapsed = Double(DispatchTime.now().uptimeNanoseconds - tNow) / 1_000_000_000.0
-        let rem = (1.0 / fps) - tickElapsed
-        if rem > 0 { Thread.sleep(forTimeInterval: rem) }
-    }
-
-    game.step(decision.executed)
-    totalSteps += 1
-    stats.best = max(stats.best, game.score)
-    if !game.alive || game.won {
-        if unassisted { break }
-        stats.round += 1
-        game = SnakeGame(width: 24, height: 16, seed: seed + stats.round - 1, initialLength: 6)
     }
 }
 
