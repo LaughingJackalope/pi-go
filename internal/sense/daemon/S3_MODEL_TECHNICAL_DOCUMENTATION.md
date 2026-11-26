@@ -250,6 +250,32 @@ Because Project `decision` is native to Apple Silicon (`darwin/arm64`), we imple
 | **1-Question (`choice`) ANE Latency (Min / P50 / P95)** | `6.77 / 7.75 / 14.77 ms` | **`5.75 / 6.33 / 17.36 ms`** | **1.22× faster P50 (`-1.42 ms`)** |
 | **3-Question S3 Triad (`/v1/systemone`) (Min / P50 / P95)** | `19.67 / 23.70 / 32.43 ms` | **`17.56 / 18.28 / 25.95 ms`** | **1.20× – 1.30× faster P50 (`-5.42 ms`)** |
 | **Numerical & Decision Parity (5 S3 Triad Scenarios)** | Reference (`100%`) | **`5 / 5` (`100%`) · $\max |\Delta p| = 0.0000$** | **Bit-Exact 4-Decimal Parity** |
-| **`pi-go/internal/sense` Full Go Integration Suite** | `PASS` (`0.851s`) | **`PASS` (`0.905s`)** | **Drop-in Wire-Compatible on `:8765`** |
+| [`pi-go/internal/sense` Full Go Integration Suite] | `PASS` (`0.851s`) | **`PASS` (`0.905s`)** | **Drop-in Wire-Compatible on `:8765`** |
+
+---
+
+## 8. Full Native Swift Snake Port (`s3-snake`) & M2 ANE Power-Gating Discovery
+
+To test what happens when an entire closed-loop neuro-symbolic application—game physics, Hamiltonian cycle safety shield, 384-cell BFS, BPE tokenization, 322M-parameter transformer on ANE, and 24-bit Truecolor ANSI terminal rendering—is ported out of Python (`laya-coreml-snake`) into a single native Swift binary ([`s3_snake.swift`](file:///Users/mp/decision/s3_snake.swift) $\rightarrow$ `s3-snake`), we built:
+1. **[`export_snake_s3_heads.py`](file:///Users/mp/decision/export_snake_s3_heads.py):** Extracts the 768-dim `[CLS]` (`pooled`) vector from the `move` (`choice`) forward pass across 94 Snake states and fits a 6 KB linear-logit readout (`snake_aux_head.fp32.bin`) that predicts the `risk` and `food` `noul` probabilities directly from `move`'s `[CLS]` vector via `vDSP_dotpr` in **`<5 µs`** at **0 extra ANE calls** with **Mean Absolute Error `0.00114` (`0.11%`)**.
+2. **[`s3_snake.swift`](file:///Users/mp/decision/s3_snake.swift) & [`snake_python_vs_swift_bench.py`](file:///Users/mp/decision/snake_python_vs_swift_bench.py):** Benchmarks three configurations across 120-step uncapped episodes and a 10 FPS $\rightarrow$ 120 FPS real-time frame-deadline sweep (with full 24-bit Truecolor ANSI frame rendering on every tick):
+
+### 8.1 3-Way Full Snake Demo Benchmark on M2 MacBook Air (24 GB)
+
+| Metric (Full 24-Bit Truecolor Render Every Tick) | 1. Python `laya-coreml-snake`<br/>(3 ANE Passes + `Rich` UI) | 2. Swift `s3-snake --three-pass`<br/>(3 ANE Passes + Native ANSI UI) | 3. Swift `s3-snake` (S3 1-Pass)<br/>(1 ANE Pass + `vDSP` `[CLS]` + Native UI) | S3 Swift vs. Python Gain |
+| :--- | :---: | :---: | :---: | :---: |
+| **Cold-Boot + 6-Step ANE Warmup** | `27,100.7 ms` | **`344.8 ms`** | **`344.8 ms`** | **78.6× faster boot** |
+| **Truecolor 24-Bit ANSI Frame Render (P50 / P95)** | `2.35 / 6.95 ms` | `0.60 / 1.20 ms` | **`0.48 / 0.84 ms`** | **4.9× faster P50 / 8.3× faster P95** |
+| **ANE Inference per Tick (P50 / P95 / P99)** | `19.79 / 22.24 / 24.27 ms` | `20.85 / 24.72 / 26.88 ms` | **`7.14 / 8.62 / 10.85 ms`** | **2.77× faster inference** |
+| **Total Active Tick Time (P50 / P95 / P99)** | `23.12 / 26.38 / 28.50 ms` | `21.59 / 25.78 / 27.58 ms` | **`7.61 / 9.32 / 11.40 ms`** | **3.04× faster total tick** |
+| **Uncapped Throughput (Decisions + Renders / sec)** | `43.0 FPS` | `45.6 FPS` | **`129.7 FPS`** | **3.01× higher FPS (`129.7 FPS`)** |
+| **Fastest Stable Real-Time Rate ($\le 1\%$ Misses)** | `30 FPS` | `30 FPS` | **`60 FPS` (`0.0%` misses, P99 `16.0 ms`)** | **2.0× higher stable real-time FPS** |
+
+### 8.2 Empirical Hardware Finding: Apple M2 Neural Engine Idle Power-Gating (`aned`)
+During the 10 FPS $\rightarrow$ 120 FPS paced frame-deadline sweep in [`snake_python_vs_swift_bench.py`](file:///Users/mp/decision/snake_python_vs_swift_bench.py), we observed an inverse relationship between inter-frame sleep duration and ANE P99 tail latency in `s3-snake` (S3 1-Pass):
+- **At 10 FPS (`~92 ms` idle sleep between calls):** ANE P50 is `10.94 ms` and active-tick P99 is `22.5 ms` because macOS `aned` power-gates the M2 Neural Engine after ~15–20 ms of idle time.
+- **At 60 FPS (`~9 ms` idle sleep between calls):** The M2 Neural Engine stays warm in its active clock state; active-tick P99 drops to **`16.0 ms` (`0.0%` deadline misses)**.
+- **At 120 FPS (`<1 ms` sleep between calls):** Active-tick P99 drops all the way to **`9.4 ms`** (`129.7 FPS` sustained uncapped).
+
 
 
