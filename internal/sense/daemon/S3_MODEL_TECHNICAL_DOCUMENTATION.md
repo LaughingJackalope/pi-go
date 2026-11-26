@@ -275,7 +275,22 @@ To test what happens when an entire closed-loop neuro-symbolic application—gam
 During the 10 FPS $\rightarrow$ 120 FPS paced frame-deadline sweep in [`snake_python_vs_swift_bench.py`](file:///Users/mp/decision/snake_python_vs_swift_bench.py), we observed an inverse relationship between inter-frame sleep duration and ANE P99 tail latency in `s3-snake` (S3 1-Pass):
 - **At 10 FPS (`~92 ms` idle sleep between calls):** ANE P50 is `10.94 ms` and active-tick P99 is `22.5 ms` because macOS `aned` power-gates the M2 Neural Engine after ~15–20 ms of idle time.
 - **At 60 FPS (`~9 ms` idle sleep between calls):** The M2 Neural Engine stays warm in its active clock state; active-tick P99 drops to **`16.0 ms` (`0.0%` deadline misses)**.
-- **At 120 FPS (`<1 ms` sleep between calls):** Active-tick P99 drops all the way to **`9.4 ms`** (`129.7 FPS` sustained uncapped).
+- **At 120 FPS (`<1 ms` sleep between calls):** Active-tick P99 drops all the way to **`9.4 ms`** (`129.7 FPS` sustained uncapped, and **`164.5 FPS` (`6.06 ms` mean ANE inference)** over a 2,000-step soak test after wrapping `MLModel.prediction(from:)` inside `autoreleasepool { ... }` so `MLE5OutputPort` recycles hot `IOSurface` buffers immediately).
+
+---
+
+## 9. Shared `S3Core.swift` Engine & Full Native Swift Tactical Arena Suite (`s3-poker`, `s3-tactics`, `s3-breach`)
+
+We extracted the shared Apple Silicon neuro-symbolic engine into [`S3Core.swift`](file:///Users/mp/decision/S3Core.swift) (zero-copy `mmap`, $O(1)$ BPE tokenizer, `autoreleasepool`-managed `S3ANEEngine`, 24-bit Truecolor `S3Canvas`, and an **in-Swift Dual Kernel Ridge Regression trainer** `S3AuxHead.fitDualRidge` that solves $(X_{\text{aug}} X_{\text{aug}}^T + \lambda I_N)\alpha = Y_{\text{logit}}$ via `vDSP_dotpr` in `<0.1 ms` without Python) and ported all three tactical arenas:
+
+| S3 System / Arena Binary | Python (`laya_coreml`) Latency & S2 Depth | Native Swift (`S3Core.swift`) Latency & S2 Depth | Domain Outcome & Tactical Edge | Swift Speedup / Gain |
+| :--- | :---: | :---: | :---: | :---: |
+| **1. [`s3-cortexd`](file:///Users/mp/decision/s3_cortexd.swift)**<br/>Always-On Daemon for Go `pi-go` | Boot: `25,870 ms`<br/>1Q/3Q: `7.75 / 23.70 ms`<br/>Dirty RAM: `~395 MB` | Boot: **`172.1 – 415.8 ms`**<br/>1Q/3Q: **`6.33 / 18.28 ms`**<br/>Dirty RAM: **`16.28 MB`** | **`5/5` (`100%`) parity**<br/>$\max |\Delta p| = 0.0000$<br/>`pi-go` tests `PASS` | **62×–150× faster boot**<br/>**24× less dirty RAM** |
+| **2. [`s3-snake`](file:///Users/mp/decision/s3_snake.swift)**<br/>Hamiltonian Cycle + Truecolor TUI | Boot: `27,101 ms`<br/>Tick P50: `23.12 ms`<br/>Max Stable: `30 FPS` (`43.0` max) | Boot: **`344.8 ms`**<br/>Tick P50: **`7.61 ms`** (`6.06 ms` soak)<br/>Max Stable: **`60 FPS` (`164.5` max)** | **0 deaths** over 2,000 steps<br/>Score `61` (100% cycle order)<br/>Truecolor render: **`0.48 ms`** | **78.6× faster boot**<br/>**3.8× higher FPS (`164.5/s`)**<br/>**2.0× stable FPS ceiling** |
+| **3. [`s3-poker`](file:///Users/mp/decision/s3_poker.swift)**<br/>64-Bit Bitboard Hold'em | Boot: `~25,800 ms`<br/>Turn P50: `26.10 ms`<br/>S2: `90` MC rollouts (`~5.5 ms`) | Boot: **`178.8 ms`**<br/>Turn P50: **`6.11 ms`**<br/>S2: **`2,500` MC rollouts (`0.273 ms`)** | Tactical: **`+\$930` (`+77.5 BB/100`)**<br/>Naive: `+\$200` (`+16.7 BB/100`)<br/>Policy Edge: **`+\$730`** | **4.27× faster turn**<br/>**27.8× deeper S2 MC search**<br/>(**560× faster rollouts/ms**) |
+| **4. [`s3-tactics`](file:///Users/mp/decision/s3_tactics.swift)**<br/>Final Fantasy Tactics 3v3 Grid | Boot: `~25,800 ms`<br/>Turn P50: `19.00 ms`<br/>S2: 1-ply static sum | Boot: **`171.8 ms`**<br/>Turn P50: **`6.13 ms`**<br/>S2: **5-ply CT clock (`5,286` states)** | Wins: **`15/16` (`93.8%`)** vs Naive `6/16`<br/>Friendly-Fire: **`0`** vs Naive `5`<br/>Backstabs: **`49`** | **3.10× faster turn**<br/>**5-ply dynamic CT lookahead**<br/>**0 friendly-fire hits** |
+| **5. [`s3-breach`](file:///Users/mp/decision/s3_breach.swift)**<br/>Weird-Machine Flaw Hunter | Boot: `~25,800 ms`<br/>Step P50: `20.10 ms`<br/>Total Audit: `~245 ms` (`12` steps) | Boot: **`178.7 ms`**<br/>Step P50: **`5.84 ms`**<br/>Total Audit: **`77.5 ms` (`12` steps)** | Flaws: **`4/4` (`100%` in 12 steps)**<br/>Ghost States Split: **`5/5`**<br/>Chaos Monkey @12: `3/4` | **3.44× faster step**<br/>**Full 4-flaw audit in `77.5 ms`** |
+
 
 
 
