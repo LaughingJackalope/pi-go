@@ -21,14 +21,16 @@ import (
 
 // MethodTouch records how a single method interacts with its receiver struct's fields.
 type MethodTouch struct {
-	StructName string   `json:"struct_name"`
-	MethodName string   `json:"method_name"`
-	File       string   `json:"file"`
-	Line       int      `json:"line"`
-	Reads      []string `json:"reads"`
-	Writes     []string `json:"writes"`
-	Calls      []string `json:"calls,omitempty"`
-	UsesLock   bool     `json:"uses_lock"`
+	StructName     string   `json:"struct_name"`
+	MethodName     string   `json:"method_name"`
+	File           string   `json:"file"`
+	Line           int      `json:"line"`
+	Reads          []string `json:"reads"`
+	Writes         []string `json:"writes"`
+	UnlockedWrites []string `json:"unlocked_writes,omitempty"`
+	Calls          []string `json:"calls,omitempty"`
+	UsesLock       bool     `json:"uses_lock"`
+	IsPrivate      bool     `json:"is_private,omitempty"`
 }
 
 // CouplingAnomaly describes an implicit state-machine hazard discovered in Bullet Time.
@@ -107,6 +109,13 @@ func AnalyzePackageDir(dir string, focusFile string) (*PackageStateGraph, error)
 				for _, field := range st.Fields.List {
 					typeStr := exprTypeString(field.Type)
 					isLock := strings.Contains(typeStr, "Mutex") || strings.Contains(typeStr, "RWMutex")
+					if len(field.Names) == 0 && isLock {
+						emb := embeddedLockName(field.Type)
+						if emb != "" {
+							graph.LockFields[sName] = append(graph.LockFields[sName], emb)
+						}
+						continue
+					}
 					for _, id := range field.Names {
 						graph.StructFields[sName] = append(graph.StructFields[sName], id.Name)
 						if isLock {
@@ -146,6 +155,7 @@ func AnalyzePackageDir(dir string, focusFile string) (*PackageStateGraph, error)
 
 			reads := make(map[string]bool)
 			writes := make(map[string]bool)
+			calls := make(map[string]bool)
 			usesLock := false
 
 			// Walk AST statements in method body.
@@ -158,7 +168,7 @@ func AnalyzePackageDir(dir string, focusFile string) (*PackageStateGraph, error)
 						}
 					}
 					for _, rhs := range stmt.Rhs {
-						collectReceiverReads(rhs, recvVar, knownFields, lockFields, reads)
+						collectReceiverReadsAndCalls(rhs, recvVar, knownFields, lockFields, reads, calls)
 					}
 					return false
 				case *ast.IncDecStmt:
@@ -167,11 +177,19 @@ func AnalyzePackageDir(dir string, focusFile string) (*PackageStateGraph, error)
 					}
 					return false
 				case *ast.CallExpr:
-					// Check for t.mu.Lock() / RLock() or delete(t.mapField, ...)
+					// Check for t.mu.Lock() / RLock(), embedded t.Lock(), intra-struct helper calls, or delete(t.mapField, ...)
 					if sel, ok := stmt.Fun.(*ast.SelectorExpr); ok {
 						mName := sel.Sel.Name
-						if (mName == "Lock" || mName == "RLock") && rootReceiverField(sel.X, recvVar, lockFields) != "" {
-							usesLock = true
+						if mName == "Lock" || mName == "RLock" {
+							if rootReceiverField(sel.X, recvVar, lockFields) != "" {
+								usesLock = true
+							} else if id, ok := sel.X.(*ast.Ident); ok && id.Name == recvVar && len(lockFields) > 0 {
+								usesLock = true
+							}
+						} else if mName != "Unlock" && mName != "RUnlock" && !ast.IsExported(mName) {
+							if id, ok := sel.X.(*ast.Ident); ok && id.Name == recvVar && !knownFields[mName] && !lockFields[mName] {
+								calls[mName] = true
+							}
 						}
 					}
 					if ident, ok := stmt.Fun.(*ast.Ident); ok && ident.Name == "delete" && len(stmt.Args) > 0 {
@@ -195,19 +213,38 @@ func AnalyzePackageDir(dir string, focusFile string) (*PackageStateGraph, error)
 				Line:       pos.Line,
 				Reads:      sortedKeys(reads),
 				Writes:     sortedKeys(writes),
+				Calls:      sortedKeys(calls),
 				UsesLock:   usesLock,
+				IsPrivate:  !ast.IsExported(fn.Name.Name),
 			})
 		}
 	}
 
-	graph.Anomalies = detectCouplingAnomalies(graph, filepath.Base(focusFile))
+	graph.Anomalies = detectCouplingAnomalies(graph, cleanFocusBase(focusFile))
 	return graph, nil
 }
 
-// expandIntraClassCalls propagates 1-hop intra-class helper calls (e.g. Bot.task()
-// calling self.watch() or self.close() in taskbot.py) so coupled state mutations
-// factored into private/helper methods are visible at the caller level.
+func cleanFocusBase(focusFile string) string {
+	if strings.TrimSpace(focusFile) == "" {
+		return ""
+	}
+	return filepath.Base(focusFile)
+}
+
+// expandIntraClassCalls propagates 1-hop intra-class helper calls while preserving
+// per-field lock provenance: if a caller delegates to a helper that acquires the lock
+// internally (e.g. Kubernetes waitingPod.Reject -> stopWithStatus, Kafka FetchBuffer.add -> addAll,
+// or Hermes _kill_stale_stream -> _cancel_current_stream_attempt), those callee-locked
+// writes are NOT marked as unlocked on the caller.
 func expandIntraClassCalls(g *PackageStateGraph) {
+	// Initialize direct lock provenance before 1-hop expansion
+	for i := range g.Methods {
+		m := &g.Methods[i]
+		if m.UnlockedWrites == nil && !m.UsesLock && len(m.Writes) > 0 {
+			m.UnlockedWrites = append([]string(nil), m.Writes...)
+		}
+	}
+
 	lookup := make(map[[2]string]MethodTouch)
 	for _, m := range g.Methods {
 		lookup[[2]string{m.StructName, m.MethodName}] = m
@@ -219,13 +256,22 @@ func expandIntraClassCalls(g *PackageStateGraph) {
 		}
 		rSet := make(map[string]bool)
 		wSet := make(map[string]bool)
+		uSet := make(map[string]bool)
 		for _, r := range m.Reads {
 			rSet[r] = true
 		}
 		for _, w := range m.Writes {
 			wSet[w] = true
 		}
+		if !m.UsesLock {
+			for _, u := range m.UnlockedWrites {
+				uSet[u] = true
+			}
+		}
 		for _, calleeName := range m.Calls {
+			if calleeName == "ensureToday" || calleeName == "load" || calleeName == "init" {
+				continue
+			}
 			if callee, ok := lookup[[2]string{m.StructName, calleeName}]; ok {
 				for _, r := range callee.Reads {
 					rSet[r] = true
@@ -233,10 +279,20 @@ func expandIntraClassCalls(g *PackageStateGraph) {
 				for _, w := range callee.Writes {
 					wSet[w] = true
 				}
+				if !m.UsesLock && !callee.UsesLock {
+					for _, u := range callee.UnlockedWrites {
+						uSet[u] = true
+					}
+				}
 			}
 		}
 		m.Reads = sortedKeys(rSet)
 		m.Writes = sortedKeys(wSet)
+		if m.UsesLock {
+			m.UnlockedWrites = nil
+		} else {
+			m.UnlockedWrites = sortedKeys(uSet)
+		}
 	}
 }
 
@@ -247,6 +303,16 @@ func expandIntraClassCalls(g *PackageStateGraph) {
 //     (and co-read in ≥1 method, forming a coupled state invariant like
 //     lastPromptTokens <-> cachePrefixTokens), but a method mutates A without B.
 func detectCouplingAnomalies(g *PackageStateGraph, focusBase string) []CouplingAnomaly {
+	// Track intra-class callers before expanding helper calls: private sub-step helpers
+	// called by intra-class methods have their reads/writes audited at the caller level
+	// (e.g. Kubernetes threadSafeMap.updateLocked or Kafka BufferPool.freeUp).
+	intraCallers := make(map[[2]string]int)
+	for _, m := range g.Methods {
+		for _, c := range m.Calls {
+			intraCallers[[2]string{m.StructName, c}]++
+		}
+	}
+
 	expandIntraClassCalls(g)
 	var anomalies []CouplingAnomaly
 
@@ -266,8 +332,16 @@ func detectCouplingAnomalies(g *PackageStateGraph, focusBase string) []CouplingA
 		coRead := make(map[[2]string]int)
 
 		for _, m := range methods {
+			if isAssumedLockedOrInitMethod(m.MethodName) {
+				// Avoid counting *Locked/*Unlocked sub-helpers twice alongside their callers
+				continue
+			}
+			unlockedSet := make(map[string]bool)
+			for _, u := range m.UnlockedWrites {
+				unlockedSet[u] = true
+			}
 			for _, w := range m.Writes {
-				if m.UsesLock {
+				if !unlockedSet[w] {
 					lockedWrites[w]++
 				}
 				for _, w2 := range m.Writes {
@@ -297,8 +371,12 @@ func detectCouplingAnomalies(g *PackageStateGraph, focusBase string) []CouplingA
 			if focusBase != "" && m.File != focusBase {
 				continue
 			}
-			// Ignore constructors / initializers like New* or load()
-			if strings.HasPrefix(m.MethodName, "New") || m.MethodName == "load" || m.MethodName == "ensureToday" {
+			// Ignore constructors, initializers, explicit *Locked/*Unlocked caller-contract helpers,
+			// and private sub-step helpers already audited via their intra-class callers.
+			if isAssumedLockedOrInitMethod(m.MethodName) {
+				continue
+			}
+			if m.IsPrivate && intraCallers[[2]string{sName, m.MethodName}] > 0 {
 				continue
 			}
 
@@ -307,9 +385,9 @@ func detectCouplingAnomalies(g *PackageStateGraph, focusBase string) []CouplingA
 				writeSet[w] = true
 			}
 
-			// Check 1: Unlocked write to a mutex-protected state field
-			if hasLocks && !m.UsesLock && len(m.Writes) > 0 {
-				for _, w := range m.Writes {
+			// Check 1: Unlocked write to a mutex-protected state field (using per-field lock provenance)
+			if hasLocks && len(m.UnlockedWrites) > 0 {
+				for _, w := range m.UnlockedWrites {
 					if lockedWrites[w] >= 2 {
 						anomalies = append(anomalies, CouplingAnomaly{
 							Kind:       "UNLOCKED_STATE_WRITE",
@@ -396,11 +474,21 @@ func rootReceiverField(expr ast.Expr, recvVar string, validFields map[string]boo
 	}
 }
 
-func collectReceiverReads(expr ast.Expr, recvVar string, knownFields, lockFields map[string]bool, out map[string]bool) {
+func collectReceiverReadsAndCalls(expr ast.Expr, recvVar string, knownFields, lockFields map[string]bool, outReads, outCalls map[string]bool) {
 	ast.Inspect(expr, func(n ast.Node) bool {
-		if sel, ok := n.(*ast.SelectorExpr); ok {
-			if fld := rootReceiverField(sel, recvVar, knownFields); fld != "" && !lockFields[fld] {
-				out[fld] = true
+		switch node := n.(type) {
+		case *ast.CallExpr:
+			if sel, ok := node.Fun.(*ast.SelectorExpr); ok {
+				mName := sel.Sel.Name
+				if mName != "Lock" && mName != "Unlock" && mName != "RLock" && mName != "RUnlock" && !ast.IsExported(mName) {
+					if id, ok := sel.X.(*ast.Ident); ok && id.Name == recvVar && !knownFields[mName] && !lockFields[mName] {
+						outCalls[mName] = true
+					}
+				}
+			}
+		case *ast.SelectorExpr:
+			if fld := rootReceiverField(node, recvVar, knownFields); fld != "" && !lockFields[fld] {
+				outReads[fld] = true
 			}
 		}
 		return true
@@ -414,4 +502,31 @@ func sortedKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func embeddedLockName(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.SelectorExpr:
+		return t.Sel.Name
+	case *ast.StarExpr:
+		return embeddedLockName(t.X)
+	default:
+		return ""
+	}
+}
+
+func isAssumedLockedOrInitMethod(name string) bool {
+	if strings.HasPrefix(name, "New") || strings.HasPrefix(name, "new") ||
+		name == "__init__" || name == "constructor" || name == "apply" ||
+		name == "load" || name == "init" || name == "ensureToday" ||
+		name == "String" || name == "toString" || name == "hashCode" || name == "equals" {
+		return true
+	}
+	lower := strings.ToLower(name)
+	return strings.HasSuffix(lower, "locked") ||
+		strings.HasSuffix(lower, "unlocked") ||
+		strings.HasSuffix(lower, "nolock") ||
+		strings.HasSuffix(lower, "unsynchronized")
 }

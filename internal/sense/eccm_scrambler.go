@@ -45,6 +45,20 @@ func StructuralSignature(filePath, content string) string {
 		return hex.EncodeToString(h.Sum(nil))[:16]
 	}
 
+	// C-style comment languages (Java, Scala, TypeScript): strip // and /* ... */
+	if strings.HasSuffix(filePath, ".java") || strings.HasSuffix(filePath, ".scala") ||
+		strings.HasSuffix(filePath, ".ts") || strings.HasSuffix(filePath, ".tsx") {
+		for _, line := range stripCStyleCommentsPreserveLines(content) {
+			norm := strings.Join(strings.Fields(line), " ")
+			if norm == "" {
+				continue
+			}
+			_, _ = h.Write([]byte(norm))
+			_, _ = h.Write([]byte{'\n'})
+		}
+		return hex.EncodeToString(h.Sum(nil))[:16]
+	}
+
 	// Python / generic normalized structural signature
 	for _, rawLine := range strings.Split(content, "\n") {
 		line := stripPyComment(rawLine)

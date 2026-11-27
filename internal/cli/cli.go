@@ -285,6 +285,7 @@ Set a default in ~/.pi-go/config.json so --model is only needed to deviate;
 
 	cmd.AddCommand(newPingCmd())
 	cmd.AddCommand(newAuditCmd())
+	cmd.AddCommand(newS3Cmd())
 	cmd.AddCommand(newServeCmd())
 	cmd.AddCommand(newMemoryCmd())
 	cmd.AddCommand(newModelCmd())

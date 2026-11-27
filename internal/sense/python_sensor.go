@@ -124,17 +124,34 @@ func AnalyzePythonDir(dir string, focusFile string) (*PackageStateGraph, error) 
 		usesLock := false
 
 		flushMethod := func() {
-			if curClass != "" && curMethod != "" && curMethod != "__init__" {
-				graph.Methods = append(graph.Methods, MethodTouch{
-					StructName: curClass,
-					MethodName: curMethod,
-					File:       f.name,
-					Line:       methodLine,
-					Reads:      sortedKeys(reads),
-					Writes:     sortedKeys(writes),
-					Calls:      sortedKeys(calls),
-					UsesLock:   usesLock,
-				})
+			if curClass != "" && curMethod != "" {
+				if curMethod == "__init__" {
+					// Record __init__'s intra-class helper calls (e.g. _reconcile_adopted) without
+					// counting constructor field initializations as runtime state mutations.
+					if len(calls) > 0 {
+						graph.Methods = append(graph.Methods, MethodTouch{
+							StructName: curClass,
+							MethodName: "__init__",
+							File:       f.name,
+							Line:       methodLine,
+							Calls:      sortedKeys(calls),
+							UsesLock:   true,
+							IsPrivate:  true,
+						})
+					}
+				} else {
+					graph.Methods = append(graph.Methods, MethodTouch{
+						StructName: curClass,
+						MethodName: curMethod,
+						File:       f.name,
+						Line:       methodLine,
+						Reads:      sortedKeys(reads),
+						Writes:     sortedKeys(writes),
+						Calls:      sortedKeys(calls),
+						UsesLock:   usesLock,
+						IsPrivate:  strings.HasPrefix(curMethod, "_"),
+					})
+				}
 			}
 			curMethod = ""
 		}
@@ -229,7 +246,7 @@ func AnalyzePythonDir(dir string, focusFile string) (*PackageStateGraph, error) 
 		flushMethod()
 	}
 
-	graph.Anomalies = detectCouplingAnomalies(graph, filepath.Base(focusFile))
+	graph.Anomalies = detectCouplingAnomalies(graph, cleanFocusBase(focusFile))
 	return graph, nil
 }
 

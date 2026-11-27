@@ -307,25 +307,9 @@ func (e *Engine) EvaluateToolTurn(
 	e.mu.Unlock()
 
 	if toolName == "edit" || toolName == "write" || toolName == "read" {
-		dir := filepath.Dir(filePath)
-		switch {
-		case strings.HasSuffix(filePath, ".go"):
-			if g, err := AnalyzePackageDir(dir, filePath); err == nil {
-				astGraph = g
-				r := BuildPreFlightRadar(filePath, g)
-				if r != "" {
-					e.mu.Lock()
-					e.knownRadars[filePath] = r
-					e.mu.Unlock()
-				}
-				if toolName == "read" {
-					preFlightRadar = r
-				} else {
-					anomalies = g.Anomalies
-				}
-			}
-		case strings.HasSuffix(filePath, ".py"):
-			if g, err := AnalyzePythonDir(dir, filePath); err == nil {
+		if DetectFileLanguage(filepath.Base(filePath)) != "" {
+			dir := filepath.Dir(filePath)
+			if g, _, err := AnalyzeAnyDir(dir, filePath); err == nil && g != nil {
 				astGraph = g
 				r := BuildPreFlightRadar(filePath, g)
 				if r != "" {

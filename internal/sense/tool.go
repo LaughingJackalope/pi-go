@@ -29,12 +29,12 @@ type SenseMapOutput struct {
 }
 
 // NewSenseMapTool creates the zero-token S3 Pre-Flight Radar tool ("sense_map")
-// so an agent can inspect the implicit state-machine coupling map of a Go package
-// or Python module before making an edit.
+// so an agent can inspect the implicit state-machine coupling map of a Go, Python,
+// TypeScript, Java, or Scala package/module before making an edit.
 func NewSenseMapTool() (tool.Tool, error) {
 	return functiontool.New(functiontool.Config{
 		Name: "sense_map",
-		Description: `S3 Pre-Flight Radar: Extracts the implicit state-machine coupling map (mutex-guarded fields, co-mutated coupled state fields, and active state desync anomalies) for a Go (.go) or Python (.py) file or directory in <2ms at 0 tokens. Call this before editing unfamiliar structs or stateful classes.`,
+		Description: `S3 Pre-Flight Radar: Extracts the implicit state-machine coupling map (mutex-guarded fields, co-mutated coupled state fields, and active state desync anomalies) for Go (.go), Python (.py), TypeScript (.ts/.tsx), Java (.java), or Scala (.scala) files or directories in <2ms at 0 tokens. Call this before editing unfamiliar structs or stateful classes.`,
 	}, func(_ agent.Context, input SenseMapInput) (SenseMapOutput, error) {
 		p := strings.TrimSpace(input.Path)
 		if p == "" {
@@ -52,27 +52,7 @@ func NewSenseMapTool() (tool.Tool, error) {
 			focusFile = p
 		}
 
-		// Determine whether target is Python or Go
-		isPy := strings.HasSuffix(focusFile, ".py")
-		if !isPy && info.IsDir() {
-			if entries, rErr := os.ReadDir(dir); rErr == nil {
-				for _, e := range entries {
-					if strings.HasSuffix(e.Name(), ".py") {
-						isPy = true
-						break
-					}
-				}
-			}
-		}
-
-		var graph *PackageStateGraph
-		lang := "go"
-		if isPy {
-			lang = "python"
-			graph, err = AnalyzePythonDir(dir, focusFile)
-		} else {
-			graph, err = AnalyzePackageDir(dir, focusFile)
-		}
+		graph, lang, err := AnalyzeAnyDir(dir, focusFile)
 		if err != nil {
 			return SenseMapOutput{}, err
 		}
