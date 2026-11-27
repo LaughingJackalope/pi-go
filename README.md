@@ -29,6 +29,41 @@ sandboxed tools, integrates LSP, and ships with a process-based subagent system.
 - **Extensions** — Hooks (shell callbacks), skills (`.SKILL.md` instructions), and Model Context Protocol (MCP) servers
 - **Plugin marketplaces** — Install skill bundles from any Claude Code-compatible plugin marketplace, with version tracking and updates (`pi plugin`)
 - **Skills audit** — Security scanning for hidden Unicode characters, BiDi attacks, and supply-chain threats in skill files (`pi audit`)
+- **Subcortical Control Plane (`pi-s3` / `internal/sense`)** — Sub-20 ms polyglot state-coupling radar, parallel cross-language blast-radius scanner (`Go`, `Java`, `Scala`, `Python`, `TypeScript`), ECCM fuzzy edit auto-lock, and drop-in `pi s3 audit | blast | hook` CLI subcommands backed by `s3-cortexd`
+
+## Subcortical Control Plane (`pi-s3`) & Public Multi-Repo A/B Benchmark
+
+Coding agents regularly pass primary-file checks while silently introducing **unlocked mutex writes**, **half-mutated coupled state maps** (outside their narrow `read_file` window), or **broken downstream callers and cross-language REST/wire contracts**. `pi-s3` (`internal/sense` + `pi s3`) adds a deterministic + Dual-Tier subcortical reflex gate (`s3-cortexd` on Apple Silicon ANE/GPU: `1.7–4.3 MB` dirty RAM after `42+ hours` uptime) directly around tool calls—either natively inside `pi` or as a drop-in JSON hook for Claude Code, Cursor, or external harnesses.
+
+### Controlled 32-Task, 5-Language, 4-Repo A/B Proof
+
+Same model (`gemma4:latest` `8B` Q4\_K\_M, `temperature = 0.0`, `seed = 42`), same prompts, and same tools across **`kubernetes/kubernetes` (`Go`)**, **`apache/kafka` (`Java` + `Scala`)**, **`NousResearch/hermes-agent` (`Python` + `TypeScript`)**, and **`pi-go` (`Go`)** (`64` full trajectories — full diffs & analysis in [docs/S3_AB_BENCHMARK_PROOF.md](docs/S3_AB_BENCHMARK_PROOF.md)):
+
+| Metric (`N = 32` Tasks · `64` Trajectories) | `baseline` | `s3_hooked` (`pi-s3`) | Impact |
+| :--- | :---: | :---: | :--- |
+| **Apparent Functional Completion** | `27/32` (`84.4%`) | `27/32` (`84.4%`) | Same primary-file pass rate (`48%` of `baseline` passes hid structural bugs) |
+| **Verified Clean Completion (0 Escaped Bugs)** | **`14/32` (`43.8%`)** | **`21/32` (`65.6%`)** | **`+21.8 pp` (`+50.0%` relative lift)** |
+| **Silent Structural Bugs Escaping to Final Diff** | **`41` bugs** (`13` tasks) | **`15` bugs** (`6` tasks) | **`-63.4%` escaped bugs (`-53.8%` buggy PRs)** |
+| **Cross-File / Cross-Language Contract Clean Pass (`8`)** | `0/8` (`0.0%`, `22` bugs) | **`3/8` (`37.5%`, `8` bugs)** | **`-63.6%` broken downstream callers / routes** |
+| **Edit-Drift / ECCM Wasted Turns (`2`)** | `6` (`5.0` turns/task) | **`2` (`3.5` turns/task)** | **`-66.7%` wasted turns · `-36.3%` tokens** |
+| **Stateless Negative Controls (`6` across 5 langs)** | `6/6` (`3.0` turns, `0` waste) | **`6/6` (`3.0` turns, `0` waste)** | **Zero false positives / zero regressions** |
+| **S3 Engine Latency Overhead** | `0.0 ms` | **`434.0 ms / task`** | **`0.67%` of LLM wall-clock runtime** |
+
+### `pi s3` 60-Second Quickstart
+
+```bash
+# 1. Audit any Go, Java, Scala, Python, or TypeScript repo for mutex asymmetry & coupled-state desyncs
+pi s3 audit .
+pi s3 audit --json /path/to/kubernetes/pkg/kubelet/pod
+
+# 2. Compute cross-package & cross-language blast radius before refactoring a file or API route
+pi s3 blast internal/guardrail/guardrail.go
+
+# 3. Drop-in PreToolUse / PostToolUse JSON hooks for Claude Code, Cursor, or custom agent loops
+#    (~/.claude/settings.json)
+#    "PreToolUse":  [{"matcher": "Edit|Write", "hooks": [{"type": "command", "command": "pi s3 hook pre-tool"}]}]
+#    "PostToolUse": [{"matcher": "Read|Edit|Write|Bash", "hooks": [{"type": "command", "command": "pi s3 hook post-tool"}]}]
+```
 
 ## Architecture
 
@@ -36,7 +71,7 @@ sandboxed tools, integrates LSP, and ships with a process-based subagent system.
 cmd/pi/             Entry point — CLI parsing, output mode selection
 internal/
 ├── agent/          ADK agent setup, retry logic, runner
-├── cli/            Cobra CLI flags, output modes (interactive, print, json, rpc)
+├── cli/            Cobra CLI flags, output modes (interactive, print, json, rpc), `pi s3` subcommands
 ├── config/         Global and project config (roles, hooks, MCP, themes)
 ├── audit/          Security scanner for skills (hidden Unicode, supply-chain threats)
 ├── extension/      Hooks, skills, MCP server integration
@@ -45,6 +80,7 @@ internal/
 ├── palace/         Memory Palace — drawers, layers, KG, miners, embedder, search
 ├── provider/       LLM providers implementing genai model interface
 ├── rpc/            Unix socket JSON-RPC 2.0 server
+├── sense/          S3 Subcortical Control Plane (5-lang state-coupling AST/polyglot sensors, blast radius, ECCM, router)
 ├── session/        JSONL persistence, branching, compaction
 ├── subagent/       Process spawner, orchestrator, concurrency pool
 ├── tools/          Sandboxed tools (read, write, edit, bash, grep, find, git, lsp)
