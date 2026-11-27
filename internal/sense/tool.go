@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"google.golang.org/adk/v2/agent"
@@ -83,13 +84,34 @@ func BuildPreFlightRadar(filePath string, g *PackageStateGraph) string {
 	}
 	expandIntraClassCalls(g)
 
+	focusBase := ""
+	if info, err := os.Stat(filePath); err == nil && !info.IsDir() {
+		focusBase = filepath.Base(filePath)
+	} else if ext := filepath.Ext(filePath); ext != "" {
+		focusBase = filepath.Base(filePath)
+	}
+
+	structsInFocusFile := make(map[string]bool)
 	byStruct := make(map[string][]MethodTouch)
 	for _, m := range g.Methods {
 		byStruct[m.StructName] = append(byStruct[m.StructName], m)
+		if focusBase == "" || m.File == focusBase {
+			structsInFocusFile[m.StructName] = true
+		}
 	}
 
 	var lines []string
-	for sName, methods := range byStruct {
+	structNames := make([]string, 0, len(byStruct))
+	for sName := range byStruct {
+		if len(structsInFocusFile) > 0 && !structsInFocusFile[sName] {
+			continue
+		}
+		structNames = append(structNames, sName)
+	}
+	sort.Strings(structNames)
+
+	for _, sName := range structNames {
+		methods := byStruct[sName]
 		var structLines []string
 		if locks := g.LockFields[sName]; len(locks) > 0 {
 			lockedFields := make(map[string]bool)
