@@ -29,6 +29,7 @@ import (
 	"github.com/dimetron/pi-go/internal/memory"
 	"github.com/dimetron/pi-go/internal/notice"
 	"github.com/dimetron/pi-go/internal/provider"
+	"github.com/dimetron/pi-go/internal/sense"
 	pisession "github.com/dimetron/pi-go/internal/session"
 	"github.com/dimetron/pi-go/internal/subagent"
 	"github.com/dimetron/pi-go/internal/tools"
@@ -474,7 +475,11 @@ func deferredInitCoreTools(sandboxRoot, worktreeDir string, res *initResources) 
 	if err != nil {
 		return nil, fmt.Errorf("creating bash control tools: %w", err)
 	}
-	return append(coreTools, bashCtlTools...), nil
+	allCore := append(coreTools, bashCtlTools...)
+	if senseTool, sErr := sense.NewSenseMapTool(); sErr == nil {
+		allCore = append(allCore, senseTool)
+	}
+	return allCore, nil
 }
 
 // deferredParallelState collects what the phase-2 goroutines discover. Fields
@@ -640,13 +645,30 @@ func buildDeferredCallbacks(
 	// makes two different results collide and the second is wrongly reported as
 	// "content is unchanged". See the note in cli.go where the same chain is
 	// wired for non-interactive runs.
-	afterCBs = append(afterCBs, tools.BuildDedupCallback(resultDeduper), compactorCB)
+	senseEngine := sense.NewEngineFromEnv()
+	var smolModel, slowModel string
+	if rc, ok := cfg.Roles["smol"]; ok && (rc.Provider == "" || rc.Provider == providerName) {
+		smolModel = rc.Model
+	}
+	if rc, ok := cfg.Roles["slow"]; ok && (rc.Provider == "" || rc.Provider == providerName) {
+		slowModel = rc.Model
+	}
+	senseEngine.ConfigureCapacitorRouter(smolModel, slowModel, 8)
+	beforeCBs = append(beforeCBs, senseEngine.BuildBeforeToolCallback())
+	afterCBs = append(afterCBs,
+		tools.BuildDedupCallback(resultDeduper),
+		compactorCB,
+		senseEngine.BuildAfterToolCallback(),
+	)
 
 	// LLM tracing: before/after model callbacks emit spans per LLM invocation.
 	llmBefore, llmAfter := extension.BuildLLMTracingCallbacks(providerName)
 
 	// Inject image bytes (screenshots) as visible InlineData parts for the model.
-	llmBefore = append(llmBefore, extension.BuildReadImageCallback(sandbox, providerName))
+	llmBefore = append(llmBefore,
+		extension.BuildReadImageCallback(sandbox, providerName),
+		senseEngine.BuildBeforeModelCallback(),
+	)
 
 	if memRecorder != nil {
 		afterCBs = append(afterCBs, memRecorder.afterTool)
@@ -852,6 +874,9 @@ func (r *deferredMemoryRecorder) setReady(sessionID string, worker *memory.Worke
 
 func (r *deferredMemoryRecorder) afterTool(_ adkagent.Context, t adktool.Tool, args, result map[string]any, toolErr error) (map[string]any, error) {
 	if toolErr != nil {
+		return result, nil
+	}
+	if retain, ok := result["system1_memory_retain"].(bool); ok && !retain {
 		return result, nil
 	}
 

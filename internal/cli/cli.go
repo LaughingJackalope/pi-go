@@ -40,6 +40,7 @@ import (
 	"github.com/dimetron/pi-go/internal/provider"
 	"github.com/dimetron/pi-go/internal/ratelimit"
 	"github.com/dimetron/pi-go/internal/retry"
+	"github.com/dimetron/pi-go/internal/sense"
 	pisession "github.com/dimetron/pi-go/internal/session"
 	"github.com/dimetron/pi-go/internal/subagent"
 	"github.com/dimetron/pi-go/internal/tools"
@@ -284,6 +285,7 @@ Set a default in ~/.pi-go/config.json so --model is only needed to deviate;
 
 	cmd.AddCommand(newPingCmd())
 	cmd.AddCommand(newAuditCmd())
+	cmd.AddCommand(newS3Cmd())
 	cmd.AddCommand(newServeCmd())
 	cmd.AddCommand(newMemoryCmd())
 	cmd.AddCommand(newModelCmd())
@@ -732,6 +734,9 @@ func initNonInteractiveRuntime(ctx context.Context, cfg *config.Config, cwd, san
 		return nil, fmt.Errorf("creating bash control tools: %w", err)
 	}
 	coreTools = append(coreTools, bashCtlTools...)
+	if senseTool, sErr := sense.NewSenseMapTool(); sErr == nil {
+		coreTools = append(coreTools, senseTool)
+	}
 
 	repoRoot := detectGitRoot(ctx, cwd)
 	discovery, err := subagent.DiscoverAgents(cwd, subagent.ScopeBoth)
@@ -844,10 +849,22 @@ func runNonInteractive(
 	// that the model is never served stale bytes, which only holds when the hash
 	// covers the pre-compaction content.
 	resultDeduper := tools.NewResultDeduper()
+	senseEngine := sense.NewEngineFromEnv()
+	var smolModel, slowModel string
+	if rc, ok := cfg.Roles["smol"]; ok && (rc.Provider == "" || rc.Provider == info.Provider) {
+		smolModel = rc.Model
+	}
+	if rc, ok := cfg.Roles["slow"]; ok && (rc.Provider == "" || rc.Provider == info.Provider) {
+		slowModel = rc.Model
+	}
+	senseEngine.ConfigureCapacitorRouter(smolModel, slowModel, 8)
+	beforeCBs = append(beforeCBs, senseEngine.BuildBeforeToolCallback())
+	llmBefore = append(llmBefore, senseEngine.BuildBeforeModelCallback())
 	afterCBs = append(afterCBs,
 		lsp.BuildLSPAfterToolCallback(lspMgr),
 		tools.BuildDedupCallback(resultDeduper),
-		tools.BuildCompactorCallback(compactorConfigFrom(cfg), tools.NewCompactMetrics()))
+		tools.BuildCompactorCallback(compactorConfigFrom(cfg), tools.NewCompactMetrics()),
+		senseEngine.BuildAfterToolCallback())
 
 	// The recorder reads memSessionID at call time, so recording starts from
 	// the point the session is created below.
@@ -1495,6 +1512,9 @@ func memoryObservationCallback(worker *memory.Worker, cfg config.Config, project
 
 	return func(_ adkagent.Context, t adktool.Tool, args, result map[string]any, toolErr error) (map[string]any, error) {
 		if toolErr != nil || *sessionID == "" {
+			return result, nil
+		}
+		if retain, ok := result["system1_memory_retain"].(bool); ok && !retain {
 			return result, nil
 		}
 		name := t.Name()

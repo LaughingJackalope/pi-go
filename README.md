@@ -29,6 +29,44 @@ sandboxed tools, integrates LSP, and ships with a process-based subagent system.
 - **Extensions** — Hooks (shell callbacks), skills (`.SKILL.md` instructions), and Model Context Protocol (MCP) servers
 - **Plugin marketplaces** — Install skill bundles from any Claude Code-compatible plugin marketplace, with version tracking and updates (`pi plugin`)
 - **Skills audit** — Security scanning for hidden Unicode characters, BiDi attacks, and supply-chain threats in skill files (`pi audit`)
+- **Subcortical Control Plane (`pi-s3` / `internal/sense`)** — Sub-20 ms polyglot state-coupling radar, parallel cross-language blast-radius scanner (`Go`, `Java`, `Scala`, `Python`, `TypeScript`), ECCM fuzzy edit auto-lock, and drop-in `pi s3 audit | blast | hook` CLI subcommands backed by `s3-cortexd`
+
+## Subcortical Control Plane (`pi-s3`) & Public Multi-Repo A/B Benchmark
+
+Coding agents regularly pass primary-file checks while silently introducing **unlocked mutex writes**, **half-mutated coupled state maps** (outside their narrow `read_file` window), or **broken downstream callers and cross-language REST/wire contracts**. `pi-s3` (`internal/sense` + `pi s3`) adds a deterministic + Dual-Tier subcortical reflex gate (`s3-cortexd` on Apple Silicon ANE/GPU: `1.7–4.3 MB` dirty RAM after `42+ hours` uptime) directly around tool calls—either natively inside `pi` or as a drop-in JSON hook for Claude Code, Cursor, or external harnesses.
+
+### Controlled 32-Task, 5-Language, 4-Repo Multi-Model A/B Proof (`352` Trajectories)
+
+Same model, `temperature = 0.0`, `seed = 42`, same prompts, and same tools across **`kubernetes/kubernetes` (`Go`)**, **`apache/kafka` (`Java` + `Scala`)**, **`NousResearch/hermes-agent` (`Python` + `TypeScript`)**, and **`pi-go` (`Go`)** (`352` full trajectories across 5 models + Capacitor Router — full breakdown, verbatim diffs & boundary analysis in [docs/S3_AB_BENCHMARK_PROOF.md](docs/S3_AB_BENCHMARK_PROOF.md)):
+
+| Model Tier (`32` Tasks / Arm) | `baseline` Clean Pass (0 Escaped Bugs) | `s3_hooked` (`pi-s3`) Clean Pass | Clean Lift | Escaped Silent Bugs (`B` -> `S3`) | Stateful Narrow-Window Bugs (`B` -> `S3`) | Cost (`32` Tasks, `B` -> `S3`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Local Edge:** `ollama/gemma4:latest` (`8B` Q4) | `14/32` (`43.8%`) | **`21/32` (`65.6%`)** | **`+21.8 pp`** | **`41` -> `15` (`-63.4%`)** | `19` -> `7` (`-63.2%`) | `$0.00` -> `$0.00` |
+| **Frontier Daily-Driver:** `anthropic/claude-sonnet-5.5` | `20/32` (`62.5%`) | **`24/32` (`75.0%`)** | **`+12.5 pp`** | `26` -> `30`* (`func`: `87.5%`->`100%`) | `62.5%` -> **`81.2%`** clean | `$0.72` -> `$0.98` |
+| **RL Repo Specialist:** `openai/gpt-5.3-codex` | `21/32` (`65.6%`) | **`25/32` (`78.1%`)** | **`+12.5 pp`** | **`34` -> `10` (`-70.6%`)** | **`18` -> `0` (`-100%`)** | `$0.73` -> `$0.84` |
+| **Frontier Flagship:** `x-ai/grok-4.7` | `24/32` (`75.0%`) | **`27/32` (`84.4%`)** | **`+9.4 pp`** | **`27` -> `10` (`-63.0%`)** | **`19` -> `0` (`-100%`)** | `$0.44` -> `$0.54` |
+| **Ultra-Cheap Flash:** `deepseek/deepseek-v4.1-flash` (`6`-turn cap) | `25/32` (`78.1%`) | `24/32` (`75.0%`) | `-3.1 pp` | `19` -> `30`* (`func`: `96.9%`->`100%`) | `81.2%` -> `81.2%` clean | `$0.03` -> `$0.04` |
+| **Ultra-Cheap Flash:** `deepseek/deepseek-v4.1-flash` (`12`-turn completion) | `28/32` (`87.5%`) | **`29/32` (`90.6%`)** | **`+3.1 pp`** | **`16` -> `15`** (`T05,T06,T13,T21,T30` fixed) | `81.2%` -> **`87.5%`** clean | `$0.04` -> `$0.06` |
+| **Capacitor Router (`s3_routed`):** `deepseek-v4.1-flash` -> `claude-sonnet-5.5` (`17%` slow turns) | *(vs. unhooked Sonnet `62.5%`)* | **`23/32` (`71.9%`)** | **`+9.4 pp` vs. Sonnet B** | `30` bugs (`8` tasks) | `81.2%` clean | **`$0.45` (`-38%` vs. Sonnet B)** |
+
+- **Zero tax on clean stateless code:** Across all 6 stateless negative-control tasks (`Go`, `Java`, `Scala`, `Python`, `TypeScript`), `pi-s3` achieved **`30/30` (`100%`) clean pass across all 5 models with `0` false vetoes** (`0.67%–4.22%` S3 engine latency overhead; `0` wasted turns across all 32 tasks on `grok-4.7 + pi-s3`).
+- **Verified by a 100% independent compiler, `go test -race`, & behavioral oracle (`zero` `pi-s3` code):** Re-scoring all `352` saved diffs via real compilers/ThreadSanitizer ([docs/S3_AB_BENCHMARK_PROOF.md](docs/S3_AB_BENCHMARK_PROOF.md#4-independent-zero-circularity-compiler--race--behavioral-oracle)) reached **`84.4%–96.9%` agreement** (`31/32` on `codex` & `grok-4.7`), confirming **`+12.5 pp` lift on `claude-sonnet-5.5` (`71.9%` -> `84.4%`, hitting `16/16` [`100%`] clean on stateful narrow-window tasks)**, **`+12.5 pp` on local `gemma4` (`12` -> `5` buggy PRs)**, **`+3.1 pp` on `deepseek-v4.1-flash` (`78.1%` -> `81.2%`)**, **`+6.2 pp` on `s3_routed` over unhooked Sonnet at `-38%` cost**, and **`0` concurrency/invariant failures across all 16 stateful tasks on all 3 frontier flagships** (`5` -> `3` [`-40%`] buggy PRs on `codex` & `grok-4.7`).
+
+### `pi s3` 60-Second Quickstart
+
+```bash
+# 1. Audit any Go, Java, Scala, Python, or TypeScript repo for mutex asymmetry & coupled-state desyncs
+pi s3 audit .
+pi s3 audit --json /path/to/kubernetes/pkg/kubelet/pod
+
+# 2. Compute cross-package & cross-language blast radius before refactoring a file or API route
+pi s3 blast internal/guardrail/guardrail.go
+
+# 3. Drop-in PreToolUse / PostToolUse JSON hooks for Claude Code, Cursor, or custom agent loops
+#    (~/.claude/settings.json)
+#    "PreToolUse":  [{"matcher": "Edit|Write", "hooks": [{"type": "command", "command": "pi s3 hook pre-tool"}]}]
+#    "PostToolUse": [{"matcher": "Read|Edit|Write|Bash", "hooks": [{"type": "command", "command": "pi s3 hook post-tool"}]}]
+```
 
 ## Architecture
 
@@ -36,7 +74,7 @@ sandboxed tools, integrates LSP, and ships with a process-based subagent system.
 cmd/pi/             Entry point — CLI parsing, output mode selection
 internal/
 ├── agent/          ADK agent setup, retry logic, runner
-├── cli/            Cobra CLI flags, output modes (interactive, print, json, rpc)
+├── cli/            Cobra CLI flags, output modes (interactive, print, json, rpc), `pi s3` subcommands
 ├── config/         Global and project config (roles, hooks, MCP, themes)
 ├── audit/          Security scanner for skills (hidden Unicode, supply-chain threats)
 ├── extension/      Hooks, skills, MCP server integration
@@ -45,6 +83,7 @@ internal/
 ├── palace/         Memory Palace — drawers, layers, KG, miners, embedder, search
 ├── provider/       LLM providers implementing genai model interface
 ├── rpc/            Unix socket JSON-RPC 2.0 server
+├── sense/          S3 Subcortical Control Plane (5-lang state-coupling AST/polyglot sensors, blast radius, ECCM, router)
 ├── session/        JSONL persistence, branching, compaction
 ├── subagent/       Process spawner, orchestrator, concurrency pool
 ├── tools/          Sandboxed tools (read, write, edit, bash, grep, find, git, lsp)
