@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -280,6 +281,16 @@ func runS3ExternalHook(ctx context.Context, out io.Writer, phase string, payload
 				}
 			}
 		}
+
+		// Exhaustive-Reader Adaptive Orientation Policy:
+		// Suppress redundant Pre-Flight Radar on repeated reads of the same file,
+		// wide-window reads (>=60% of file), or exhaustive read streaks (>=3 consecutive reads),
+		// while keeping all Edit/Write/Stop-Hook invariants and cross-file blast alerts active.
+		if suppressed, reason := updateAdaptiveReaderState(stateFile, toolName, filePath, toolInput, verdict.PreFlightRadar != ""); suppressed {
+			verdict.PreFlightRadar = ""
+			resp["radar_suppressed_reason"] = reason
+		}
+
 		resp["s3_verdict"] = verdict
 		var ctxBlocks []string
 		if verdict.PreFlightRadar != "" {
@@ -329,10 +340,107 @@ func resolveHookFilePath(in, res map[string]any) string {
 }
 
 type hookPersistedState struct {
-	History map[string][]sense.StateSnapshot `json:"history"`
+	History          map[string][]sense.StateSnapshot `json:"history"`
+	RadarEmitted     map[string]bool                  `json:"radar_emitted,omitempty"`
+	ReadCounts       map[string]int                   `json:"read_counts,omitempty"`
+	ConsecutiveReads int                              `json:"consecutive_reads,omitempty"`
 }
 
 func loadHookHistory(_ *sense.Engine, _ string) {}
+
+func hookIntParam(m map[string]any, keys ...string) int {
+	for _, k := range keys {
+		switch v := m[k].(type) {
+		case float64:
+			return int(v)
+		case int:
+			return v
+		}
+	}
+	return 0
+}
+
+// updateAdaptiveReaderState tracks surgical vs. exhaustive reading patterns across
+// hook invocations. Returns (true, reason) when PreFlightRadar should be muted on Read.
+func updateAdaptiveReaderState(stateFile, toolName, filePath string, toolInput map[string]any, hasRadar bool) (bool, string) {
+	if stateFile == "" {
+		return false, ""
+	}
+	var st hookPersistedState
+	if raw, err := os.ReadFile(stateFile); err == nil {
+		_ = json.Unmarshal(raw, &st)
+	}
+	if st.RadarEmitted == nil {
+		st.RadarEmitted = make(map[string]bool)
+	}
+	if st.ReadCounts == nil {
+		st.ReadCounts = make(map[string]int)
+	}
+
+	save := func() {
+		if encoded, err := json.Marshal(st); err == nil {
+			_ = os.WriteFile(stateFile, encoded, 0o600)
+		}
+	}
+
+	if toolName == "edit" || toolName == "write" {
+		st.ConsecutiveReads = 0
+		if filePath != "" {
+			delete(st.RadarEmitted, filePath)
+		}
+		save()
+		return false, ""
+	}
+
+	if toolName != "read" || filePath == "" {
+		return false, ""
+	}
+
+	st.ConsecutiveReads++
+	st.ReadCounts[filePath]++
+
+	if !hasRadar {
+		save()
+		return false, ""
+	}
+
+	// 1. Deduplicate identical radar already emitted for this file before any edit
+	if st.RadarEmitted[filePath] {
+		save()
+		return true, "already_emitted"
+	}
+
+	// 2. Wide-window read covering >=60% of the file directly -> exhaustive reader
+	startLine := hookIntParam(toolInput, "start_line", "offset")
+	endLine := hookIntParam(toolInput, "end_line")
+	limit := hookIntParam(toolInput, "limit")
+	linesRead := 0
+	if startLine > 0 && endLine >= startLine {
+		linesRead = endLine - startLine + 1
+	} else if limit > 0 {
+		linesRead = limit
+	}
+	if linesRead > 0 {
+		if rawBytes, err := os.ReadFile(filePath); err == nil {
+			totalLines := bytes.Count(rawBytes, []byte{'\n'}) + 1
+			if totalLines > 0 && float64(linesRead)/float64(totalLines) >= 0.60 {
+				save()
+				return true, "exhaustive_reader_coverage"
+			}
+		}
+	}
+
+	// 3. Exhaustive read streak (>=3 consecutive Read calls without editing)
+	if st.ConsecutiveReads >= 3 {
+		save()
+		return true, "exhaustive_reader_streak"
+	}
+
+	// Surgical reader: emit radar once and remember
+	st.RadarEmitted[filePath] = true
+	save()
+	return false, ""
+}
 
 func recordHookSnapshot(stateFile, filePath, sig, label string) (bool, string) {
 	if stateFile == "" || filePath == "" || sig == "" {

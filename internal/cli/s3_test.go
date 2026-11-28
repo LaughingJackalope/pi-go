@@ -119,3 +119,101 @@ func (c *Cache) Get(k string) (string, int) {
 		t.Fatalf("expected post-tool hook to detect A->B->A Warp Scrambler cycle across invocations, got: %s", postOutA.String())
 	}
 }
+
+func TestS3HookAdaptiveReaderPolicy(t *testing.T) {
+	t.Setenv("PI_SYSTEM1_URL", "off")
+	tmpDir := t.TempDir()
+	goFile := filepath.Join(tmpDir, "store.go")
+	src := `package store
+
+import "sync"
+
+type Cache struct {
+	mu    sync.Mutex
+	items map[string]int
+	index map[string]int
+}
+
+func (c *Cache) Put(k string, v int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.items[k] = v
+	c.index[k] = v
+}
+
+func (c *Cache) Delete(k string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.items, k)
+	delete(c.index, k)
+}
+`
+	if err := os.WriteFile(goFile, []byte(src), 0o644); err != nil {
+		t.Fatalf("write store.go: %v", err)
+	}
+	stateFile := filepath.Join(tmpDir, "adaptive_state.json")
+
+	callRead := func(start, end int) map[string]any {
+		payload := map[string]any{
+			"tool_name": "Read",
+			"tool_input": map[string]any{
+				"file_path":  goFile,
+				"start_line": start,
+				"end_line":   end,
+			},
+		}
+		raw, _ := json.Marshal(payload)
+		cmd := newRootCmd()
+		var out bytes.Buffer
+		cmd.SetIn(bytes.NewReader(raw))
+		cmd.SetOut(&out)
+		cmd.SetArgs([]string{"s3", "hook", "post-tool", "--state-file", stateFile})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("hook read failed: %v", err)
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal hook resp: %v", err)
+		}
+		return resp
+	}
+
+	// 1. First narrow surgical read (lines 1..5 of ~24 = 20%) MUST emit Pre-Flight Radar
+	r1 := callRead(1, 5)
+	if ctx, _ := r1["additionalContext"].(string); !strings.Contains(ctx, "PRE-FLIGHT RADAR") {
+		t.Fatalf("expected surgical first read to emit Pre-Flight Radar, got: %+v", r1)
+	}
+
+	// 2. Second read of the same file MUST suppress duplicate radar ("already_emitted")
+	r2 := callRead(6, 12)
+	if reason, _ := r2["radar_suppressed_reason"].(string); reason != "already_emitted" {
+		t.Fatalf("expected second read of same file to suppress radar with already_emitted, got: %+v", r2)
+	}
+	if _, hasCtx := r2["additionalContext"]; hasCtx {
+		t.Fatalf("expected no additionalContext when radar suppressed, got: %+v", r2)
+	}
+
+	// 3. Fresh state with wide exhaustive read (>=60% of file) MUST suppress radar immediately
+	stateFile2 := filepath.Join(tmpDir, "adaptive_state_wide.json")
+	payloadWide, _ := json.Marshal(map[string]any{
+		"tool_name": "Read",
+		"tool_input": map[string]any{
+			"file_path":  goFile,
+			"start_line": 1,
+			"end_line":   22,
+		},
+	})
+	cmdWide := newRootCmd()
+	var outWide bytes.Buffer
+	cmdWide.SetIn(bytes.NewReader(payloadWide))
+	cmdWide.SetOut(&outWide)
+	cmdWide.SetArgs([]string{"s3", "hook", "post-tool", "--state-file", stateFile2})
+	if err := cmdWide.Execute(); err != nil {
+		t.Fatalf("hook wide read failed: %v", err)
+	}
+	var rWide map[string]any
+	_ = json.Unmarshal(outWide.Bytes(), &rWide)
+	if reason, _ := rWide["radar_suppressed_reason"].(string); reason != "exhaustive_reader_coverage" {
+		t.Fatalf("expected wide read to suppress radar with exhaustive_reader_coverage, got: %+v", rWide)
+	}
+}
