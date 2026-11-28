@@ -50,6 +50,7 @@ Same model, `temperature = 0.0`, `seed = 42`, same prompts, and same tools acros
 | **Capacitor Router (`s3_routed`):** `deepseek-v4.1-flash` -> `claude-sonnet-5.5` (`17%` slow turns) | *(vs. unhooked Sonnet `62.5%`)* | **`23/32` (`71.9%`)** | **`+9.4 pp` vs. Sonnet B** | `30` bugs (`8` tasks) | `81.2%` clean | **`$0.45` (`-38%` vs. Sonnet B)** |
 
 - **Zero tax on clean stateless code:** Across all 6 stateless negative-control tasks (`Go`, `Java`, `Scala`, `Python`, `TypeScript`), `pi-s3` achieved **`30/30` (`100%`) clean pass across all 5 models with `0` false vetoes** (`0.67%–4.22%` S3 engine latency overhead; `0` wasted turns across all 32 tasks on `grok-4.7 + pi-s3`).
+- **Verified by a 100% independent compiler, `go test -race`, & behavioral oracle (`zero` `pi-s3` code):** Re-scoring all `352` saved diffs via real compilers/ThreadSanitizer ([docs/S3_AB_BENCHMARK_PROOF.md](docs/S3_AB_BENCHMARK_PROOF.md#4-independent-zero-circularity-compiler--race--behavioral-oracle)) reached **`84.4%–96.9%` agreement** (`31/32` on `codex` & `grok-4.7`), confirming **`+12.5 pp` lift on `claude-sonnet-5.5` (`71.9%` -> `84.4%`, hitting `16/16` [`100%`] clean on stateful narrow-window tasks)**, **`+12.5 pp` on local `gemma4` (`12` -> `5` buggy PRs)**, **`+3.1 pp` on `deepseek-v4.1-flash` (`78.1%` -> `81.2%`)**, **`+6.2 pp` on `s3_routed` over unhooked Sonnet at `-38%` cost**, and **`0` concurrency/invariant failures across all 16 stateful tasks on all 3 frontier flagships** (`5` -> `3` [`-40%`] buggy PRs on `codex` & `grok-4.7`).
 
 ### `pi s3` 60-Second Quickstart
 
