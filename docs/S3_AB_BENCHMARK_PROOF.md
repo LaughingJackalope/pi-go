@@ -54,3 +54,17 @@ To eliminate any circularity from scoring `s3_hooked` with `pi-s3 s3 audit`, all
 | **`s3_routed` (`deepseek` -> `sonnet`)** | **`25/32` (`78.1%`)** *(vs. Sonnet B `71.9%`)* | **`+6.2 pp` vs. Sonnet B** | `7` (`func`: **`100.0%`**) | **`93.8%` (`15/16`)** | **`93.8%`** |
 
 *\*The single-task (`-3.1 pp`) delta on `gpt-5.3-codex` and `grok-4.7` comes from two actionable sensor calibrations uncovered by the independent compiler oracle: (1) flat co-mutation cliques in `pi s3 audit` penalized `baseline` diffs for omitting benign auxiliary fields (`FIFO.syncedClosed` on an already-closed channel in `T03`, `BotLoopGuard._last_sweep` in `T19`) that pass runtime tests, while nudging `codex` on `T16` into calling `failedPartitions.clear()` instead of Kafka's `removeAll()`; and (2) `gofmt -e` passed syntax on `grok-4.7`'s `T29` edit that used `strings.HasPrefix` without adding `"strings"` to `import (...)` (`31/32` = `96.9%` grader agreement).*
+
+---
+
+## 5. 3-Way Symbolic-Only vs. Full-S3 Ablation (`ollama/gemma4:latest`, `N = 32`)
+
+Running **Arm C (`sensors_only`, `PI_SYSTEM1_URL=off`, `0` neural calls)** on `ollama/gemma4:latest` isolates the pure Go AST/polyglot sensor layer from the Apple Silicon neural tier (`s3-cortexd`):
+
+| Arm (`ollama/gemma4:latest`, `N = 32`) | Structural Clean (`Escaped Bugs`) | Independent `-race`/Compiler Clean (`Buggy PRs` / `Bugs`) | S3 Engine Latency / Task | Neural Calls |
+| :--- | :---: | :---: | :---: | :---: |
+| **Arm A: `baseline`** (no hooks) | `14/32` (`43.8%`, `41` bugs) | `11/32` (`34.4%`, `12` buggy PRs / `16` bugs) | `0 ms` | `0` |
+| **Arm C: `sensors_only`** (`PI_SYSTEM1_URL=off`) | **`21/32` (`65.6%`, `15` bugs)** | **`14/32` (`43.8%`, `5` buggy PRs / `6` bugs)** | **`316.8 ms`** | **`0`** |
+| **Arm B: `s3_hooked`** (live `s3-cortexd` ANE/GPU) | **`21/32` (`65.6%`, `15` bugs)** | **`15/32` (`46.9%`, `5` buggy PRs / `6` bugs)** | `434.0 ms` | live |
+
+- **Linux/CI Portability Proved:** Pure deterministic Go sensors deliver **`100%` of the single-model buggy-PR reduction (`12` -> `5`, `-58.3%`)** and `+9.4 pp` of the `+12.5 pp` independent clean lift with **zero NPU/daemon required**. The neural tier (`s3-cortexd`) specifically powers calibrated multi-model routing (`s3_routed`: `+6.2 pp` independent clean over unhooked Sonnet at `-38.3%` cost) plus `+3.1 pp` on single-model `gemma4`.

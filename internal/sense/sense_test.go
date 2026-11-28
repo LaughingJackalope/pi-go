@@ -650,6 +650,82 @@ func TestCrossFileBlastRadiusScanner_GoInterfacesAndPortalWireContracts(t *testi
 		vDyn.RiskTier, vDyn.RecommendedRole, vDyn.SignedGain, vDyn.RescueProb, vDyn.HarmProb, vDyn.Advisory)
 }
 
+func TestQ6SensorCalibrations_MissingImportAndAuxiliaryFields(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Go file referencing `strings.HasPrefix` without importing "strings",
+	//    while also using local var `log` (must NOT false-positive on local var!).
+	goSrc := `package demo
+
+import "sync"
+
+type Cache struct {
+	mu                  sync.Mutex
+	items               map[string]string
+	lastStateChangeTime int64
+}
+
+func (c *Cache) Put(k, v string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.items[k] = v
+	c.lastStateChangeTime = 1
+}
+
+func (c *Cache) Replace(k, v string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.items[k] = v
+	c.lastStateChangeTime = 2
+}
+
+// ClearPrefix intentionally skips auxiliary timestamp lastStateChangeTime (must NOT trigger MISSING_COUPLED_WRITE),
+// but references unimported strings.HasPrefix (MUST trigger MISSING_IMPORT).
+func (c *Cache) ClearPrefix(prefix string, log struct{ Printf func(string) }) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k := range c.items {
+		if strings.HasPrefix(k, prefix) {
+			delete(c.items, k)
+			log.Printf(k)
+		}
+	}
+}
+`
+	goFile := filepath.Join(tmpDir, "cache.go")
+	if err := os.WriteFile(goFile, []byte(goSrc), 0o644); err != nil {
+		t.Fatalf("write cache.go: %v", err)
+	}
+
+	g, err := AnalyzePackageDir(tmpDir, goFile)
+	if err != nil {
+		t.Fatalf("AnalyzePackageDir: %v", err)
+	}
+
+	foundMissingStrings := false
+	for _, a := range g.Anomalies {
+		if a.Kind == "MISSING_COUPLED_WRITE" && a.PeerField == "lastStateChangeTime" {
+			t.Fatalf("unexpected MISSING_COUPLED_WRITE on auxiliary timestamp field: %s", a.Summary)
+		}
+		if a.Kind == "MISSING_IMPORT" && a.Field == "log" {
+			t.Fatalf("false positive MISSING_IMPORT on shadowed parameter `log`: %s", a.Summary)
+		}
+		if a.Kind == "MISSING_IMPORT" && a.Field == "strings" {
+			foundMissingStrings = true
+		}
+	}
+	if !foundMissingStrings {
+		t.Fatalf("expected MISSING_IMPORT anomaly for unimported `strings.HasPrefix`, got: %+v", g.Anomalies)
+	}
+
+	// 2. Verify PI_SYSTEM1_URL=off disables neural endpoint without TCP probe
+	t.Setenv("PI_SYSTEM1_URL", "off")
+	eng := NewEngineFromEnv()
+	if eng.endpoint != "" {
+		t.Fatalf("expected empty endpoint when PI_SYSTEM1_URL=off, got %q", eng.endpoint)
+	}
+}
+
 
 
 

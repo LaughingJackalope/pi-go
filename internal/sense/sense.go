@@ -107,6 +107,10 @@ func NewEngineFromEnv() *Engine {
 	if ep == "" {
 		ep = strings.TrimSpace(os.Getenv("LAYA_SYSTEM1_URL"))
 	}
+	switch strings.ToLower(ep) {
+	case "off", "none", "disabled", "false", "0":
+		return NewEngine("")
+	}
 	if ep == "" {
 		if conn, err := net.DialTimeout("tcp", "127.0.0.1:8765", 15*time.Millisecond); err == nil {
 			_ = conn.Close()

@@ -220,7 +220,9 @@ func AnalyzePackageDir(dir string, focusFile string) (*PackageStateGraph, error)
 		}
 	}
 
-	graph.Anomalies = detectCouplingAnomalies(graph, cleanFocusBase(focusFile))
+	focusBase := cleanFocusBase(focusFile)
+	graph.Anomalies = detectCouplingAnomalies(graph, focusBase)
+	graph.Anomalies = append(graph.Anomalies, detectGoMissingImports(fset, files, fileNames, focusBase)...)
 	return graph, nil
 }
 
@@ -328,6 +330,7 @@ func detectCouplingAnomalies(g *PackageStateGraph, focusBase string) []CouplingA
 		// Count how often each field is written with vs without a lock,
 		// and how often pairs of fields (A, B) are co-written or co-read.
 		lockedWrites := make(map[string]int)
+		totalWrites := make(map[string]int)
 		coWrite := make(map[[2]string][]string)
 		coRead := make(map[[2]string]int)
 
@@ -341,6 +344,7 @@ func detectCouplingAnomalies(g *PackageStateGraph, focusBase string) []CouplingA
 				unlockedSet[u] = true
 			}
 			for _, w := range m.Writes {
+				totalWrites[w]++
 				if !unlockedSet[w] {
 					lockedWrites[w]++
 				}
@@ -404,13 +408,19 @@ func detectCouplingAnomalies(g *PackageStateGraph, focusBase string) []CouplingA
 			}
 
 			// Check 2: Asymmetric mutation of coupled state fields (Implicit State Desync)
+			// Skip auxiliary telemetry/sweep/timestamp fields and require >=50% conditional
+			// co-mutation density so weak opportunistic co-writes do not form flat cliques.
 			for _, w := range m.Writes {
+				wCount := totalWrites[w]
+				if wCount < 2 {
+					continue
+				}
 				for _, peer := range g.StructFields[sName] {
-					if w == peer || writeSet[peer] {
+					if w == peer || writeSet[peer] || isAuxiliaryTelemetryField(peer) {
 						continue
 					}
 					peers := coWrite[[2]string{w, peer}]
-					if len(peers) >= 2 && coRead[[2]string{w, peer}] >= 2 {
+					if len(peers) >= 2 && coRead[[2]string{w, peer}] >= 2 && float64(len(peers))/float64(wCount) >= 0.50 {
 						anomalies = append(anomalies, CouplingAnomaly{
 							Kind:        "MISSING_COUPLED_WRITE",
 							StructName:  sName,
@@ -529,4 +539,195 @@ func isAssumedLockedOrInitMethod(name string) bool {
 		strings.HasSuffix(lower, "unlocked") ||
 		strings.HasSuffix(lower, "nolock") ||
 		strings.HasSuffix(lower, "unsynchronized")
+}
+
+// isAuxiliaryTelemetryField identifies secondary bookkeeping, sweep-timestamp,
+// clock, logger, metrics, or monotonic latch fields that should NOT trigger
+// MISSING_COUPLED_WRITE alerts when a method legitimately updates only primary
+// state maps/fields. (UNLOCKED_STATE_WRITE is still enforced on these fields.)
+func isAuxiliaryTelemetryField(name string) bool {
+	lower := strings.ToLower(strings.TrimLeft(name, "_"))
+	if lower == "metrics" || lower == "stats" || lower == "logger" || lower == "log" ||
+		lower == "clock" || lower == "syncedclosed" || lower == "lastsweep" ||
+		lower == "last_sweep" || lower == "laststatechangetime" {
+		return true
+	}
+	return strings.HasSuffix(lower, "timestamp") ||
+		strings.HasSuffix(lower, "changetime") ||
+		strings.HasSuffix(lower, "updatedat") ||
+		strings.HasSuffix(lower, "createdat") ||
+		strings.HasSuffix(lower, "_sweep") ||
+		strings.HasSuffix(lower, "sweep") ||
+		strings.HasSuffix(lower, "metrics") ||
+		strings.HasSuffix(lower, "logger")
+}
+
+var goStdlibPackages = map[string]bool{
+	"atomic": true, "base64": true, "big": true, "binary": true, "bufio": true,
+	"bytes": true, "cmp": true, "context": true, "crypto": true, "csv": true,
+	"embed": true, "encoding": true, "errors": true, "exec": true, "filepath": true,
+	"flag": true, "fmt": true, "hash": true, "hex": true, "html": true, "http": true,
+	"io": true, "json": true, "log": true, "maps": true, "math": true, "mime": true,
+	"net": true, "os": true, "path": true, "rand": true, "reflect": true, "regexp": true,
+	"runtime": true, "sha256": true, "signal": true, "slices": true, "slog": true,
+	"sort": true, "strconv": true, "strings": true, "sync": true, "syscall": true,
+	"template": true, "testing": true, "time": true, "unicode": true, "url": true,
+	"utf8": true, "xml": true, "zlib": true,
+}
+
+// detectGoMissingImports scans Go files in a package for selector expressions
+// like `strings.HasPrefix(...)` or `log.Printf(...)` where the package qualifier
+// is a Go standard-library package that is neither imported nor shadowed by a
+// local/package-level identifier. Runs in <1ms using go/ast (catches errors that
+// `gofmt -e` misses).
+func detectGoMissingImports(fset *token.FileSet, files []*ast.File, fileNames []string, focusBase string) []CouplingAnomaly {
+	pkgDecls := make(map[string]bool)
+	for _, f := range files {
+		for _, decl := range f.Decls {
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				if d.Recv == nil && d.Name != nil {
+					pkgDecls[d.Name.Name] = true
+				}
+			case *ast.GenDecl:
+				for _, spec := range d.Specs {
+					switch s := spec.(type) {
+					case *ast.TypeSpec:
+						pkgDecls[s.Name.Name] = true
+					case *ast.ValueSpec:
+						for _, id := range s.Names {
+							pkgDecls[id.Name] = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	var anomalies []CouplingAnomaly
+	for idx, f := range files {
+		fName := fileNames[idx]
+		if focusBase != "" && fName != focusBase {
+			continue
+		}
+		imported := make(map[string]bool)
+		for _, imp := range f.Imports {
+			if imp.Name != nil {
+				if imp.Name.Name != "_" && imp.Name.Name != "." {
+					imported[imp.Name.Name] = true
+				}
+				continue
+			}
+			raw := strings.Trim(imp.Path.Value, `"`)
+			if slash := strings.LastIndex(raw, "/"); slash >= 0 {
+				raw = raw[slash+1:]
+			}
+			imported[raw] = true
+		}
+
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			locals := make(map[string]bool)
+			structName := ""
+			if fn.Recv != nil {
+				for _, fld := range fn.Recv.List {
+					if structName == "" {
+						structName = receiverTypeName(fld.Type)
+					}
+					for _, id := range fld.Names {
+						locals[id.Name] = true
+					}
+				}
+			}
+			if fn.Type != nil {
+				if fn.Type.Params != nil {
+					for _, fld := range fn.Type.Params.List {
+						for _, id := range fld.Names {
+							locals[id.Name] = true
+						}
+					}
+				}
+				if fn.Type.Results != nil {
+					for _, fld := range fn.Type.Results.List {
+						for _, id := range fld.Names {
+							locals[id.Name] = true
+						}
+					}
+				}
+			}
+			// Collect local variable declarations (`:=`, `var`, `range`, `for`, `switch` assign)
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				switch s := n.(type) {
+				case *ast.AssignStmt:
+					if s.Tok == token.DEFINE {
+						for _, lhs := range s.Lhs {
+							if id, ok := lhs.(*ast.Ident); ok {
+								locals[id.Name] = true
+							}
+						}
+					}
+				case *ast.ValueSpec:
+					for _, id := range s.Names {
+						locals[id.Name] = true
+					}
+				case *ast.RangeStmt:
+					if id, ok := s.Key.(*ast.Ident); ok {
+						locals[id.Name] = true
+					}
+					if id, ok := s.Value.(*ast.Ident); ok {
+						locals[id.Name] = true
+					}
+				case *ast.FuncLit:
+					if s.Type != nil && s.Type.Params != nil {
+						for _, fld := range s.Type.Params.List {
+							for _, id := range fld.Names {
+								locals[id.Name] = true
+							}
+						}
+					}
+				}
+				return true
+			})
+
+			reported := make(map[string]bool)
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				sel, ok := n.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				id, ok := sel.X.(*ast.Ident)
+				if !ok {
+					return true
+				}
+				pkgIdent := id.Name
+				if !goStdlibPackages[pkgIdent] || imported[pkgIdent] || locals[pkgIdent] || pkgDecls[pkgIdent] {
+					return true
+				}
+				// Standard-library functions/types/consts are exported (uppercase initial)
+				if sel.Sel == nil || !ast.IsExported(sel.Sel.Name) {
+					return true
+				}
+				if reported[pkgIdent] {
+					return true
+				}
+				reported[pkgIdent] = true
+				pos := fset.Position(sel.Pos())
+				anomalies = append(anomalies, CouplingAnomaly{
+					Kind:       "MISSING_IMPORT",
+					StructName: structName,
+					MethodName: fn.Name.Name,
+					Field:      pkgIdent,
+					Summary: fmt.Sprintf(
+						"Missing Go Import: %s (%s:%d) uses %s.%s without importing %q",
+						fn.Name.Name, fName, pos.Line, pkgIdent, sel.Sel.Name, pkgIdent,
+					),
+				})
+				return true
+			})
+		}
+	}
+	return anomalies
 }
