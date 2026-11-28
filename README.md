@@ -45,7 +45,8 @@ Same model, `temperature = 0.0`, `seed = 42`, same prompts, and same tools acros
 | **Frontier Daily-Driver:** `anthropic/claude-sonnet-5.5` | `20/32` (`62.5%`) | **`24/32` (`75.0%`)** | **`+12.5 pp`** | `26` -> `30`* (`func`: `87.5%`->`100%`) | `62.5%` -> **`81.2%`** clean | `$0.72` -> `$0.98` |
 | **RL Repo Specialist:** `openai/gpt-5.3-codex` | `21/32` (`65.6%`) | **`25/32` (`78.1%`)** | **`+12.5 pp`** | **`34` -> `10` (`-70.6%`)** | **`18` -> `0` (`-100%`)** | `$0.73` -> `$0.84` |
 | **Frontier Flagship:** `x-ai/grok-4.7` | `24/32` (`75.0%`) | **`27/32` (`84.4%`)** | **`+9.4 pp`** | **`27` -> `10` (`-63.0%`)** | **`19` -> `0` (`-100%`)** | `$0.44` -> `$0.54` |
-| **Ultra-Cheap Flash:** `deepseek/deepseek-v4.1-flash` | `25/32` (`78.1%`) | `24/32` (`75.0%`) | `-3.1 pp` | `19` -> `30`* (`func`: `96.9%`->`100%`) | `81.2%` -> `81.2%` clean | `$0.03` -> `$0.04` |
+| **Ultra-Cheap Flash:** `deepseek/deepseek-v4.1-flash` (`6`-turn cap) | `25/32` (`78.1%`) | `24/32` (`75.0%`) | `-3.1 pp` | `19` -> `30`* (`func`: `96.9%`->`100%`) | `81.2%` -> `81.2%` clean | `$0.03` -> `$0.04` |
+| **Ultra-Cheap Flash:** `deepseek/deepseek-v4.1-flash` (`12`-turn completion) | `28/32` (`87.5%`) | **`29/32` (`90.6%`)** | **`+3.1 pp`** | **`16` -> `15`** (`T05,T06,T13,T21,T30` fixed) | `81.2%` -> **`87.5%`** clean | `$0.04` -> `$0.06` |
 | **Capacitor Router (`s3_routed`):** `deepseek-v4.1-flash` -> `claude-sonnet-5.5` (`17%` slow turns) | *(vs. unhooked Sonnet `62.5%`)* | **`23/32` (`71.9%`)** | **`+9.4 pp` vs. Sonnet B** | `30` bugs (`8` tasks) | `81.2%` clean | **`$0.45` (`-38%` vs. Sonnet B)** |
 
 - **Zero tax on clean stateless code:** Across all 6 stateless negative-control tasks (`Go`, `Java`, `Scala`, `Python`, `TypeScript`), `pi-s3` achieved **`30/30` (`100%`) clean pass across all 5 models with `0` false vetoes** (`0.67%–4.22%` S3 engine latency overhead; `0` wasted turns across all 32 tasks on `grok-4.7 + pi-s3`).
