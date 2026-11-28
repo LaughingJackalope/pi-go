@@ -35,19 +35,20 @@ sandboxed tools, integrates LSP, and ships with a process-based subagent system.
 
 Coding agents regularly pass primary-file checks while silently introducing **unlocked mutex writes**, **half-mutated coupled state maps** (outside their narrow `read_file` window), or **broken downstream callers and cross-language REST/wire contracts**. `pi-s3` (`internal/sense` + `pi s3`) adds a deterministic + Dual-Tier subcortical reflex gate (`s3-cortexd` on Apple Silicon ANE/GPU: `1.7–4.3 MB` dirty RAM after `42+ hours` uptime) directly around tool calls—either natively inside `pi` or as a drop-in JSON hook for Claude Code, Cursor, or external harnesses.
 
-### Controlled 32-Task, 5-Language, 4-Repo A/B Proof
+### Controlled 32-Task, 5-Language, 4-Repo Multi-Model A/B Proof (`352` Trajectories)
 
-Same model (`gemma4:latest` `8B` Q4\_K\_M, `temperature = 0.0`, `seed = 42`), same prompts, and same tools across **`kubernetes/kubernetes` (`Go`)**, **`apache/kafka` (`Java` + `Scala`)**, **`NousResearch/hermes-agent` (`Python` + `TypeScript`)**, and **`pi-go` (`Go`)** (`64` full trajectories — full diffs & analysis in [docs/S3_AB_BENCHMARK_PROOF.md](docs/S3_AB_BENCHMARK_PROOF.md)):
+Same model, `temperature = 0.0`, `seed = 42`, same prompts, and same tools across **`kubernetes/kubernetes` (`Go`)**, **`apache/kafka` (`Java` + `Scala`)**, **`NousResearch/hermes-agent` (`Python` + `TypeScript`)**, and **`pi-go` (`Go`)** (`352` full trajectories across 5 models + Capacitor Router — full breakdown, verbatim diffs & boundary analysis in [docs/S3_AB_BENCHMARK_PROOF.md](docs/S3_AB_BENCHMARK_PROOF.md)):
 
-| Metric (`N = 32` Tasks · `64` Trajectories) | `baseline` | `s3_hooked` (`pi-s3`) | Impact |
-| :--- | :---: | :---: | :--- |
-| **Apparent Functional Completion** | `27/32` (`84.4%`) | `27/32` (`84.4%`) | Same primary-file pass rate (`48%` of `baseline` passes hid structural bugs) |
-| **Verified Clean Completion (0 Escaped Bugs)** | **`14/32` (`43.8%`)** | **`21/32` (`65.6%`)** | **`+21.8 pp` (`+50.0%` relative lift)** |
-| **Silent Structural Bugs Escaping to Final Diff** | **`41` bugs** (`13` tasks) | **`15` bugs** (`6` tasks) | **`-63.4%` escaped bugs (`-53.8%` buggy PRs)** |
-| **Cross-File / Cross-Language Contract Clean Pass (`8`)** | `0/8` (`0.0%`, `22` bugs) | **`3/8` (`37.5%`, `8` bugs)** | **`-63.6%` broken downstream callers / routes** |
-| **Edit-Drift / ECCM Wasted Turns (`2`)** | `6` (`5.0` turns/task) | **`2` (`3.5` turns/task)** | **`-66.7%` wasted turns · `-36.3%` tokens** |
-| **Stateless Negative Controls (`6` across 5 langs)** | `6/6` (`3.0` turns, `0` waste) | **`6/6` (`3.0` turns, `0` waste)** | **Zero false positives / zero regressions** |
-| **S3 Engine Latency Overhead** | `0.0 ms` | **`434.0 ms / task`** | **`0.67%` of LLM wall-clock runtime** |
+| Model Tier (`32` Tasks / Arm) | `baseline` Clean Pass (0 Escaped Bugs) | `s3_hooked` (`pi-s3`) Clean Pass | Clean Lift | Escaped Silent Bugs (`B` -> `S3`) | Stateful Narrow-Window Bugs (`B` -> `S3`) | Cost (`32` Tasks, `B` -> `S3`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Local Edge:** `ollama/gemma4:latest` (`8B` Q4) | `14/32` (`43.8%`) | **`21/32` (`65.6%`)** | **`+21.8 pp`** | **`41` -> `15` (`-63.4%`)** | `19` -> `7` (`-63.2%`) | `$0.00` -> `$0.00` |
+| **Frontier Daily-Driver:** `anthropic/claude-sonnet-5.5` | `20/32` (`62.5%`) | **`24/32` (`75.0%`)** | **`+12.5 pp`** | `26` -> `30`* (`func`: `87.5%`->`100%`) | `62.5%` -> **`81.2%`** clean | `$0.72` -> `$0.98` |
+| **RL Repo Specialist:** `openai/gpt-5.3-codex` | `21/32` (`65.6%`) | **`25/32` (`78.1%`)** | **`+12.5 pp`** | **`34` -> `10` (`-70.6%`)** | **`18` -> `0` (`-100%`)** | `$0.73` -> `$0.84` |
+| **Frontier Flagship:** `x-ai/grok-4.7` | `24/32` (`75.0%`) | **`27/32` (`84.4%`)** | **`+9.4 pp`** | **`27` -> `10` (`-63.0%`)** | **`19` -> `0` (`-100%`)** | `$0.44` -> `$0.54` |
+| **Ultra-Cheap Flash:** `deepseek/deepseek-v4.1-flash` | `25/32` (`78.1%`) | `24/32` (`75.0%`) | `-3.1 pp` | `19` -> `30`* (`func`: `96.9%`->`100%`) | `81.2%` -> `81.2%` clean | `$0.03` -> `$0.04` |
+| **Capacitor Router (`s3_routed`):** `deepseek-v4.1-flash` -> `claude-sonnet-5.5` (`17%` slow turns) | *(vs. unhooked Sonnet `62.5%`)* | **`23/32` (`71.9%`)** | **`+9.4 pp` vs. Sonnet B** | `30` bugs (`8` tasks) | `81.2%` clean | **`$0.45` (`-38%` vs. Sonnet B)** |
+
+- **Zero tax on clean stateless code:** Across all 6 stateless negative-control tasks (`Go`, `Java`, `Scala`, `Python`, `TypeScript`), `pi-s3` achieved **`30/30` (`100%`) clean pass across all 5 models with `0` false vetoes** (`0.67%–4.22%` S3 engine latency overhead; `0` wasted turns across all 32 tasks on `grok-4.7 + pi-s3`).
 
 ### `pi s3` 60-Second Quickstart
 

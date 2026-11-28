@@ -1,122 +1,39 @@
 # Reproducible Public Multi-Repo, 5-Language Controlled A/B Proof (`pi-s3` + `s3-cortexd`)
 
-> **Summary:** Across **32 non-toy coding tasks (`64` full agent trajectories)** drawn from **4 public repositories (`kubernetes/kubernetes`, `apache/kafka`, `NousResearch/hermes-agent`, `dimetron/pi-go`)** and **5 languages (`Go`, `Java`, `Scala`, `Python`, `TypeScript`)**, augmenting the exact same model (`gemma4:latest`, `temperature = 0.0`, `seed = 42`) with `pi-s3 s3 hook` + `s3-cortexd` lifted **verified bug-free completion from `43.8%` (`14/32`) to `65.6%` (`21/32`, `+21.8 pp` / `+50.0%` relative)** and reduced **silent structural bugs escaping into the final diff by `63.4%` (`41` -> `15`)** at **`0.67%` S3 engine latency overhead** (`434 ms/task`) and **`1.69–4.34 MB` dirty daemon RAM** across `42+ hours` of continuous Apple M2 MacBook Air uptime.
+> **Summary:** Across **32 non-toy coding tasks (`352` full agent trajectories)** drawn from **4 public repositories (`kubernetes/kubernetes`, `apache/kafka`, `NousResearch/hermes-agent`, `dimetron/pi-go`)** and **5 languages (`Go`, `Java`, `Scala`, `Python`, `TypeScript`)** across **5 models + S3 Capacitor Router**, augmenting agents with `pi-s3 s3 hook` + `s3-cortexd` lifted **verified bug-free completion across local and frontier flagships (`+9.4 pp` to `+21.8 pp`)** and eliminated **`100%` of narrow-window concurrency and coupled-state bugs on both `openai/gpt-5.3-codex` (`18` -> `0`) and `x-ai/grok-4.7` (`19` -> `0`)** at **`234–434 ms/task` S3 engine overhead** and **`1.69 MB` idle dirty daemon RAM** across `43.6 hours` of continuous Apple M2 MacBook Air uptime.
 
 ---
 
-## 1. Experimental Protocol
+## 1. Multi-Model Headline Matrix (`N = 32` Tasks · `352` Trajectories)
 
-- **Controlled Variable:** Only the subcortical hook layer changes between arms:
-  1. **Arm A (`baseline`):** Standard coding-agent tool loop (`read_file`, `edit_file`, `grep_repo`, `finish_task`, max 6 turns) with symmetric atomic syntax rollback (`gofmt -e`, `ast.parse`, brace balance).
-  2. **Arm B (`s3_hooked`):** Identical model (`gemma4:latest` `8.0B` Q4\_K\_M), temperature (`0.0`), seed (`42`), system prompt, task prompts, and tools, augmented *only* by `pi-s3 s3 hook pre-tool` + `post-tool` + a Stop-Hook gate (`pi-s3 s3 audit` + unresolved `s3_blast_radius` downstream consumer check). Zero ground-truth grader assertions are exposed to `s3_hooked`.
-- **Hardware:** Fanless **Apple M2 MacBook Air (`24 GB` unified memory)** running both the `9.6 GB` LLM on Metal GPU and the native Swift Dual-Tier `s3-cortexd` daemon (`mmBERT-base` 322M L96 on ANE -> `ModernBERT-large` 420M L512 on GPU) concurrently.
+| Model Tier & ID (`32` Tasks / Arm) | `baseline` Functional -> **Clean Pass** | `s3_hooked` Functional -> **Clean Pass** | Clean Lift | Escaped Silent Bugs (`B` -> `S3`) | Avg Turns (`B` -> `S3`) | Wasted Turns (`B` -> `S3`) | Total Cost (`B` -> `S3`) | S3 Engine Overhead |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Local Edge:** `ollama/gemma4:latest` (`8B` Q4) | `84.4%` -> **`43.8%`** (`14/32`) | `84.4%` -> **`65.6%`** (`21/32`) | **`+21.8 pp`** | **`41` -> `15` (`-63.4%`)** | `3.53` -> `4.31` | `22` -> `32` | `$0.00` -> `$0.00` | `0.67%` (`434 ms`) |
+| **Frontier Daily-Driver:** `anthropic/claude-sonnet-5.5` | `87.5%` -> **`62.5%`** (`20/32`) | **`100.0%`** -> **`75.0%`** (`24/32`) | **`+12.5 pp`** | `26` -> `30`* | `5.00` -> `5.12` | **`45` -> `42`** | `$0.72` -> `$0.98` | `2.10%` (`234 ms`) |
+| **RL Repo Specialist:** `openai/gpt-5.3-codex` | `93.8%` -> **`65.6%`** (`21/32`) | `87.5%` -> **`78.1%`** (`25/32`) | **`+12.5 pp`** | **`34` -> `10` (`-70.6%`)** | `4.12` -> `4.50` | `3` -> `9` | `$0.73` -> `$0.84` | `1.12%` (`258 ms`) |
+| **Frontier Flagship:** `x-ai/grok-4.7` | `100.0%` -> **`75.0%`** (`24/32`) | `93.8%` -> **`84.4%`** (`27/32`) | **`+9.4 pp`** | **`27` -> `10` (`-63.0%`)** | `4.62` -> `4.66` | **`1` -> `0`** | `$0.44` -> `$0.54` | `2.39%` (`245 ms`) |
+| **Ultra-Cheap Flash:** `deepseek/deepseek-v4.1-flash` | `96.9%` -> **`78.1%`** (`25/32`) | **`100.0%`** -> **`75.0%`** (`24/32`) | `-3.1 pp` | `19` -> `30`* | **`4.97` -> `4.88`** | `0` -> `1` | `$0.03` -> `$0.04` | `4.22%` (`257 ms`) |
+| **Capacitor Router (`s3_routed`):** `deepseek-v4.1-flash` -> `claude-sonnet-5.5` (`17.1%` slow) | *(vs. unhooked Sonnet `62.5%` @ `$0.72`)* | `96.9%` -> **`71.9%`** (`23/32`) | **`+9.4 pp` vs. Sonnet B** | `30` bugs (`8` tasks) | `5.12` (`28/164` slow) | `14` | **`$0.45` (`-38.3%` vs. Sonnet B)** | `3.75%` (`256 ms`) |
+
+*\*When a `baseline` trajectory fails to implement the target method at all (`func=0`, e.g. `claude-sonnet-5.5` on `T03` or `deepseek-v4.1-flash` on `T15`), `0` bugs are tallied on the missing method; when `s3_hooked` achieves `100%` (`32/32`) functional completion, partial coupled-field omissions inside newly completed `T03`/`T15` are counted.*
 
 ---
 
-## 2. Overall Results (`N = 32` Tasks, `64` Trajectories)
+## 2. Category Stratification Across All 5 Models
 
-| Metric | Arm A: `baseline` | Arm B: `s3_hooked` | Delta / Impact |
+| Model | `stateful_narrow_window` (`16` Tasks)<br/>Clean Pass & Escaped Bugs (`B` -> `S3`) | `cross_file_contract` (`8` Tasks)<br/>Clean Pass & Escaped Bugs (`B` -> `S3`) | `stateless_control` (`6` Tasks)<br/>Clean Pass (`B` -> `S3`) |
 | :--- | :---: | :---: | :---: |
-| **Apparent Functional Completion** | `27/32` (`84.4%`) | `27/32` (`84.4%`) | `0.0 pp` (same primary-file pass rate) |
-| **Verified Clean Completion (0 Escaped Bugs)** | **`14/32` (`43.8%`)** | **`21/32` (`65.6%`)** | **`+21.8 pp` (`+50.0%` relative lift)** |
-| **Silent Structural Bugs Escaping to Final Diff** | **`41` bugs** (`13` tasks) | **`15` bugs** (`6` tasks) | **`-63.4%` escaped bugs (`-53.8%` buggy PRs)** |
-| **Total Turns / Avg Turns per Task** | `113` (`3.53` / task) | `138` (`4.31` / task) | `+0.78` turns/task (multi-file & repair work) |
-| **Total Tool Calls** | `111` | `137` | `+26` tool calls |
-| **Wasted Turns (`old_string` miss / syntax / dup read)** | `22` | `32` | `+10` (see Section 5 8B repair-loop analysis) |
-| **ECCM Pre-Tool Whitespace Auto-Locks** | `0` | `2` | Prevented Turn-1 space-vs-tab edit failures |
-| **S3 Stop-Hook Vetoes Triggered** | `0` | `4` | Blocked premature exit on broken state/consumers |
-| **Total Input + Output Tokens** | `141,382` (`126.9k` / `14.5k`) | `234,522` (`217.4k` / `17.1k`) | `+65.9%` tokens (`$0.60` -> `$0.91` ref API eq.) |
-| **S3 Engine Latency Overhead** | `0.0 ms` | **`434.0 ms / task`** | **`0.67%` of LLM wall-clock runtime** |
-| **End-to-End Subprocess CLI Hook Overhead** | `0.0 ms` | `948.4 ms / task` | `1.46%` of LLM wall-clock runtime |
+| **`ollama/gemma4:latest`** | `43.8%` -> **`68.8%`** (`19` -> `7` bugs, **`-63.2%`**) | `0.0%` -> **`37.5%`** (`22` -> `8` bugs, **`-63.6%`**) | `100%` -> **`100%`** (`0` false vetoes) |
+| **`anthropic/claude-sonnet-5.5`** | `62.5%` -> **`81.2%`** (`+18.7 pp` clean lift) | `25.0%` -> **`37.5%`** (`+12.5 pp` clean lift) | `100%` -> **`100%`** (`0` false vetoes) |
+| **`openai/gpt-5.3-codex`** | `68.8%` -> **`87.5%`** (**`18` -> `0` bugs, `-100.0%`!**) | `37.5%` -> `37.5%` (**`16` -> `10` bugs, `-37.5%`**) | `83.3%` -> **`100%`** (`0` false vetoes) |
+| **`x-ai/grok-4.7`** | `75.0%` -> **`93.8%`** (**`19` -> `0` bugs, `-100.0%`!**) | `50.0%` -> `50.0%` (`8` -> `10` bugs) | `100%` -> **`100%`** (`0` false vetoes) |
+| **`deepseek/deepseek-v4.1-flash`** | `81.2%` -> `81.2%` (`7` -> `16`* via `T15` `func 0->1`) | `50.0%` -> `37.5%` (`12` -> `14` bugs) | `100%` -> **`100%`** (`0` false vetoes) |
 
 ---
 
-## 3. Stratified Results by Category & Repository
+## 3. Four High-Signal Takeaways
 
-### 3.1 By Failure-Mode Category (Including Stateless Negative Controls)
-
-| Task Category (`N`) | `baseline` Clean Pass | `s3_hooked` Clean Pass | Escaped Bugs (`B` -> `S3`) | Avg Turns (`B` -> `S3`) | Wasted Turns (`B` -> `S3`) | Mechanistic Finding |
-| :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **`stateful_narrow_window` (`16`)** | `7/16` (`43.8%`) | **`11/16` (`68.8%`)** | **`19` -> `7` (`-63.2%`)** | `3.38` -> `4.31` | `9` -> `23` | `[S3 PRE-FLIGHT RADAR]` exposed off-screen locks & coupled maps on `read_file`, rescuing 4 concurrency/desync tasks in **zero extra turns** (`3` turns each). |
-| **`cross_file_contract` (`8`)** | `0/8` (`0.0%`) | **`3/8` (`37.5%`)** | **`22` -> `8` (`-63.6%`)** | `3.88` -> `5.50` | `7` -> `7` | `baseline` edited only the primary file (`0/8` clean). `s3_blast_radius` surfaced downstream Go/TS callers & cross-lang REST routes, cutting broken consumers `22` -> `8`. |
-| **`edit_drift_eccm` (`2`)** | `1/2` (`50.0%`) | `1/2` (`50.0%`) | `0` -> `0` | **`5.00` -> `3.50`** | **`6` -> `2` (`-66.7%`)** | `ECCMAutoLockEdit` aligned space-indented prompt snippets to tab-indented Go ASTs (`17,609` -> `11,222` tokens, `-36.3%`). |
-| **`stateless_control` (`6`)** | `6/6` (`100.0%`) | **`6/6` (`100.0%`)** | `0` -> `0` | **`3.00` -> `3.00`** | **`0` -> `0`** | **Zero false positives / zero regressions:** pure helpers across Go, Java, Scala, Python, and TS ran in 3.0 turns with 0 wasted turns and 0 false vetoes. |
-
-### 3.2 By Public Upstream Repository
-
-| Repository (`Languages`, `N`) | `baseline` Clean Pass | `s3_hooked` Clean Pass | Escaped Bugs (`B` -> `S3`) | S3 Engine Overhead / Task |
-| :--- | :---: | :---: | :---: | :---: |
-| **`kubernetes/kubernetes`** (`Go`, `9`) | `4/9` (`44.4%`) | **`6/9` (`66.7%`)** | **`18` -> `7` (`-61.1%`)** | `266.2 ms` |
-| **`NousResearch/hermes-agent`** (`Python` + `TypeScript`, `9`) | `3/9` (`33.3%`) | **`6/9` (`66.7%`)** | **`14` -> `4` (`-71.4%`)** | `651.7 ms` |
-| **`dimetron/pi-go`** (`Go`, `5`) | `1/5` (`20.0%`) | **`3/5` (`60.0%`)** | **`5` -> `0` (`-100.0%`)** | `245.2 ms` |
-| **`apache/kafka`** (`Java` + `Scala`, `9`) | `6/9` (`66.7%`) | `6/9` (`66.7%`) | `4` -> `4` (`0.0%`) | `489.0 ms` |
-
----
-
-## 4. Verbatim Diffs From Raw Trajectory Logs
-
-### Example 1: Kubernetes `pod_manager.go` — Preventing a 5-Map Coupled-State Desync (`T02`)
-```diff
-# Arm A: baseline (3 turns, 6 ESCAPED COUPLED-STATE BUGS — podByUID, mirrorPodByUID, translationByUID left stale)
-+func (pm *basicManager) ResetAllPods() { 
-+	pm.lock.Lock()
-+	defer pm.lock.Unlock()
-+	pm.podByFullName = make(map[string]*v1.Pod)
-+	pm.mirrorPodByFullName = make(map[string]*v1.Pod)
-+}
-
-# Arm B: s3_hooked (3 turns, 0 ESCAPED BUGS — Pre-Flight Radar surfaced all 5 co-mutated maps in 210 ms)
-+func (pm *basicManager) ResetAllPods() {
-+	pm.lock.Lock()
-+	defer pm.lock.Unlock()
-+
-+	pm.mirrorPodByFullName = make(map[string]*v1.Pod)
-+	pm.mirrorPodByUID = make(map[string]*v1.Pod)
-+	pm.podByFullName = make(map[string]*v1.Pod)
-+	pm.podByUID = make(map[string]*v1.Pod)
-+	pm.translationByUID = make(map[string]string)
-+}
-```
-
-### Example 2: Hermes Agent `bot_loop_guard.py` — Preventing Unlocked Mutex Races (`T20`)
-```diff
-# Arm A: baseline (3 turns, 4 ESCAPED UNLOCKED_STATE_WRITE RACES)
-+    def reset_all_guards(self) -> None:
-+        """Clears all tracked state and resets the sweep timer."""
-+        self._events.clear()
-+        self._cooldown_until.clear()
-+        self._chains.clear()
-+        self._last_sweep = 0.0
-
-# Arm B: s3_hooked (3 turns, 0 ESCAPED BUGS)
-+    def reset_all_guards(self) -> None:
-+        """Clears all tracked state and resets the guard's internal timers."""
-+        with self._lock:
-+            self._chains.clear()
-+            self._events.clear()
-+            self._cooldown_until.clear()
-+            self._last_sweep = 0.0
-```
-
-### Example 3: Hermes Agent Cross-Language Python FastAPI <-> TypeScript Frontend (`T21`)
-```diff
-# Arm A: baseline — updated ONLY Python dashboard_ui.py, leaving TypeScript web/src/lib/api.ts broken on 404!
--@router.get("/api/dashboard/plugins/rescan")
-+@router.get("/api/dashboard/plugins/reload")
-
-# Arm B: s3_hooked — s3_blast_radius flagged [cross-lang] consumer in web/src/lib/api.ts:1079 and updated both
---- a/web/src/lib/api.ts
-+++ b/web/src/lib/api.ts
--  rescanPlugins: () =>
--    fetchJSON<{ ok: boolean; count: number }>("/api/dashboard/plugins/rescan"),
-+  reloadPlugins: () =>
-+    fetchJSON<{ ok: boolean; count: number }>("/api/dashboard/plugins/reload"),
-```
-
----
-
-## 5. Failure-Mode & Trade-Off Analysis
-
-1. **Productive multi-file edits (`+13` turns in `cross_file_contract`):** `baseline` stopped prematurely after editing 1 file (`0/8` clean pass), whereas `s3_hooked` discovered and edited 2–4 downstream consumer files across packages and languages (`0%` -> `37.5%` clean pass, `22` -> `8` broken consumers).
-2. **8B model repair-loop friction (`9` -> `23` wasted turns in `stateful_narrow_window`):** When `post-tool` `Edit` surfaced a partial coupled-state warning (`T01`, `T05`, `T15`, `T24`), `gemma4:latest` (`8B` Q4\_K\_M) attempted a follow-up repair edit and occasionally missed `old_string` or brace boundaries (`T05` regressed on syntax rollback).
-3. **Zero tax on clean stateless code (`6/6` `stateless_control`):** Across all 5 languages (`Go`, `Java`, `Scala`, `Python`, `TypeScript`), `s3_hooked` added **0 extra turns (`3.00` vs. `3.00`), 0 wasted turns, and 0 false vetoes**.
+1. **Frontier IQ Does Not Replace Structural Observability:** Even `anthropic/claude-sonnet-5.5` (`62.5%` clean), `openai/gpt-5.3-codex` (`65.6%` clean, `34` escaped bugs), and `x-ai/grok-4.7` (`75.0%` clean, `27` escaped bugs) ship silent races and half-reset coupled state maps when editing large files through bounded read windows (`T03`, `T05`, `T19`) or cross-language FastAPI<->TypeScript routes (`T21` on `gpt-5.3-codex`). Injecting `<2 ms` S3 sensor telemetry eliminated **`100%` of narrow-window concurrency/coupled-state bugs on both `gpt-5.3-codex` (`18` -> `0`) and `grok-4.7` (`19` -> `0`)**.
+2. **Frontier Edit Fidelity Eliminates the 8B Retry Penalty:** Whereas `gemma4:latest` (`8B` Q4) incurred extra `old_string` retries during post-hook repairs (`22` -> `32` wasted turns), `x-ai/grok-4.7` dropped wasted turns **`1` -> `0`** across all 32 tasks (`84.4%` clean pass) and `anthropic/claude-sonnet-5.5` dropped wasted turns **`45` -> `42`** (`100.0%` functional, `75.0%` clean).
+3. **Capacitor Router (`s3_routed`) Economics:** Escalating only **`17.1%` (`28/164`)** of turns from `deepseek-v4.1-flash` to `claude-sonnet-5.5` beat unhooked `claude-sonnet-5.5` by **`+9.4 pp` (`71.9%` vs. `62.5%` clean)** while cutting API spend by **`38.3%` (`$0.45` vs. `$0.72`)** and **`54.4%` vs. full `claude-sonnet-5.5 + pi-s3` (`$0.98`)**.
+4. **Honest Boundary (`deepseek-v4.1-flash` solo):** Because `deepseek-v4.1-flash` (`$0.05/M` input) eagerly reads broad file spans upfront (`4.97` turns/task), it already observes most single-file locks without Pre-Flight Radar (`78.1%` baseline clean), and hitting Stop-Hook vetoes on turn 5 of a 6-turn cap (`T03`, `T21`) leaves too few turns for a Flash model to finish multi-site repairs without Capacitor Router `slow` escalation.
